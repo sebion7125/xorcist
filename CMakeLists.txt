@@ -44,17 +44,25 @@ endif()
 
 # The OpenCL host layer (xorcist.cpp, guarded by XO_NO_OPENCL) is dlopen'd
 # at runtime, never linked - it is a pure compile-time header dependency on
-# CL/cl.h. The win64 MinGW cross-toolchain (CMAKE_SYSTEM_NAME=Windows) has
-# no such header in its sysroot, unlike the native Linux build where the
-# system OpenCL package provides it. Disabling it here only removes an
-# optional device-accelerated solve path; SolveBin's CPU/RLS fallback is
-# the one every build already relies on when no OpenCL runtime is present
-# at all, so this is a missing-header build gap, not a feature regression.
-# Giving Windows users the real GPU path too needs OpenCL headers inside
-# the cross sysroot (e.g. vendoring KhronosGroup/OpenCL-Headers the same
-# way RtAudio/RtMidi/PortAudio/ZitaConvolver are vendored) - a separate,
-# deliberate step, not bundled into this build-unblocking fix.
-if(WIN32)
+# CL/cl.h. Not every build environment has it: the win64 MinGW cross-
+# toolchain's sysroot never does, and - found 2026-10-25 via a GitHub
+# Actions CI run, not assumed - a bare ubuntu-22.04 CI runner doesn't
+# either (no OpenCL dev package installed), even though this project's
+# own Linux dev VM happens to have one. A platform check (originally just
+# "if(WIN32)") was therefore the wrong test: the real condition is
+# whether the header is actually there, which varies by installed
+# packages, not by OS. Checking for it directly covers both cases (and
+# any future one) uniformly. Disabling the OpenCL path when absent only
+# removes an optional device-accelerated solve path; SolveBin's CPU/RLS
+# fallback is the one every build already relies on when no OpenCL
+# runtime is present at all, so this is a missing-header build gap, not
+# a feature regression. Giving a header-less environment the real GPU
+# path too needs the OpenCL headers vendored in (e.g.
+# KhronosGroup/OpenCL-Headers, the same way RtAudio/RtMidi/PortAudio/
+# ZitaConvolver are vendored) - a separate, deliberate step.
+include(CheckIncludeFileCXX)
+check_include_file_cxx("CL/cl.h" XORCIST_HAVE_CL_CL_H)
+if(NOT XORCIST_HAVE_CL_CL_H)
   target_compile_definitions(xorcist PRIVATE XO_NO_OPENCL)
 endif()
 if(NOT XORCIST_LIBRARY_TYPE)
