@@ -94,6 +94,51 @@ inspecting a pending prediction without consuming it, and the
 every public function and the full `XorcistTuning` struct are
 documented there directly.
 
+## Configuring the tuning surface
+
+A zero-initialised `XorcistTuning` is the library's built-in default
+behaviour. Read the current tuning, change the fields you care about,
+write it back — any field left at `0` keeps its default:
+
+```c
+XorcistTuning t;
+Xorcist_getTuning(x, &t);
+
+t.order = 4;  /* per-bin Prony order instead of the order-1 rotator */
+t.gpu = 1;    /* offload the per-bin solve to OpenCL, if available  */
+
+Xorcist_setTuning(x, &t);
+```
+
+`XorcistTuning` has roughly thirty fields, documented individually in
+`xorcist.h`, but most hosts only ever need a handful of them:
+
+- **`order`** is the main quality/cost knob: `1` (default) is the
+  classic single-rotator continuation, exact for one partial per bin;
+  `2`–`8` fit a per-bin Prony model that also handles two partials in
+  the same bin, at a real, documented CPU cost per order (see the
+  field's own comment for the measured dB-vs-cost table).
+- **`gpu`** offloads the per-bin solve to OpenCL when available, with
+  automatic, silent fallback to CPU if no device is found.
+- **`seam`**, **`noTrend`**, **`detectRho`**, **`freqDamping`**,
+  **`rootClamp`** and **`safetyCap`** are smaller, independent knobs
+  worth reading if the default splice/stability behaviour doesn't fit
+  your material — each is self-contained and documented at its
+  declaration.
+
+The rest of the struct — the whole `hyb*` two-chain family, `solveTap`,
+`replica`, `schur`, `gateFit`, `staleWindow`, `backfill`, `fitWindow`,
+`solveEvery`, `burgEvery`, `v0Hindcast`, and the finer splice-timing
+fields (`capSpan`, `reentryFade`, `anchorTau`, `noFadeInRing`) — comes
+directly from this library's own development: experiments, A/B
+comparisons against an offline reference, and lab/diagnostic hooks.
+They're documented for reproducibility and for anyone doing the same
+kind of tuning work, not because a typical integration is expected to
+touch them. Several say so explicitly in their own comment (`solveTap`:
+"lab/diagnostic use only"; `replica`: "Not a recommendation"); where a
+field doesn't say so, its default (`0` unless noted) is the
+recommended starting point.
+
 ## Tests and reproducing the measured results
 
 - `tools/concealment/schur_test.c`, `schur_rho_test.c` (in the host
