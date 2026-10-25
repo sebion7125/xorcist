@@ -14,6 +14,11 @@ measured results and limitations.
 
 ![Spectrogram of a concealed dropout](docs/media/spectogram_xorcist.gif)
 
+*The vertical streaks mark where a deadline miss occurred. They stay
+confined to the highlighted shadow-buffer region instead of opening
+into a visible gap, because the continuation playing during that
+region bridges the miss rather than dropping out.*
+
 **Status:** extracted from, and still developed alongside, its host
 application ([GrandOrgue](https://github.com/GrandOrgue/grandorgue)'s
 `GOSoundConcealment`); this is the same implementation that runs there,
