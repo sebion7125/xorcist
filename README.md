@@ -10,7 +10,9 @@ for the DSP approach, and
 [`docs/disclosures/xorcist-concealment-technical-disclosure.md`](../../docs/disclosures/xorcist-concealment-technical-disclosure.md)
 (in the host repository this library was extracted from) for a full,
 host-independent technical disclosure of the technique, including its
-measured results and limitations.
+measured results and limitations. For every public function and
+`XorcistTuning` field, in man-page style, see
+[`docs/API.md`](docs/API.md).
 
 ![Spectrogram of a concealed dropout](docs/media/spectogram_xorcist.gif)
 
