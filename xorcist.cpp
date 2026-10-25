@@ -25,6 +25,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "fftw3.h"
