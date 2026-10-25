@@ -300,7 +300,7 @@ typedef struct {
    * is used once p + 2 periods have passed since the reset. */
   int hybShortCap;
   /* Order the long chain's fresh fit must reach before hand-back; 0 =
-   * the built-in 6.  At PV 4k, (6 + 2) grid points lands exactly on the
+   * the built-in 6.  At PV 2k, (6 + 2) grid points lands exactly on the
    * moment no analysis frame still contains pre-onset signal
    * (42.7 ms). */
   int hybHandOrder;
