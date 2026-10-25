@@ -19,6 +19,20 @@ confined to the highlighted shadow-buffer region instead of opening
 into a visible gap, because the continuation playing during that
 region bridges the miss rather than dropping out.*
 
+Same material, same 1764 forced gaps, from the offline analysis tool
+(`tools/gap_lab.py` in the host repository) that drives this
+comparison:
+
+| Concealment off (hard xrun) | Concealment on (Xorcist) |
+| --- | --- |
+| ![Unconcealed baseline](docs/media/gaplab_before_unconcealed.png) | ![Concealed with Xorcist](docs/media/gaplab_after_concealed.png) |
+| NMR vs. original: mean/worst excess **+13.5 / +20.6 dB** | NMR vs. original: mean/worst excess **-0.6 / +8.2 dB** |
+
+(NMR excess above 0 dB is audible; lower is better. Same signal,
+same forced-gap pattern, only the concealment strategy differs —
+"off" plays the raw dropout, the other column runs Xorcist's PRONY/
+GO-1knob strategy.)
+
 **Status:** extracted from, and still developed alongside, its host
 application ([GrandOrgue](https://github.com/GrandOrgue/grandorgue)'s
 `GOSoundConcealment`); this is the same implementation that runs there,
