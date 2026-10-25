@@ -12,6 +12,8 @@ for the DSP approach, and
 host-independent technical disclosure of the technique, including its
 measured results and limitations.
 
+![Spectrogram of a concealed dropout](docs/media/spectogram_xorcist.gif)
+
 **Status:** extracted from, and still developed alongside, its host
 application ([GrandOrgue](https://github.com/GrandOrgue/grandorgue)'s
 `GOSoundConcealment`); this is the same implementation that runs there,
