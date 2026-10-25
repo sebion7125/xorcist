@@ -299,17 +299,16 @@ static void xo_schur_clamp(
   }
 }
 
-/* rho-TEST (1:1 zu Xorcist::RhoTest in xorcist.cpp).  Schur-Abstieg als
- * reiner TEST: fruehester Abbruch bei der ersten Verletzung, kein
- * Kappen, kein Wiederaufstieg.  Rueckgabe 1 = alle Wurzeln strikt
- * innerhalb von rho.
+/* rho TEST (1:1 match of Xorcist::RhoTest in xorcist.cpp).  Schur
+ * descent run as a pure TEST: bails out at the first violation, no
+ * clamping, no re-ascent.  Returns 1 = all roots strictly inside rho.
  *
- * Der Kernel bekommt damit den DETEKTOR-MODUS, den bisher nur die CPU
- * konnte - vorher sperrte der Host das Geraet aus, sobald detectRho > 0
- * war, und das Haekchen "GPU" blieb bei der Vorgabe rho = 1.02 ohne
- * jede Wirkung.  Nebeneffekt: 96 % der Bins bestehen den Test und
- * ueberspringen Durand-Kerner ganz - der Test kostet O(p^2), die
- * Iteration O(40 p^2). */
+ * This gives the kernel the DETECTOR MODE that until now only the CPU
+ * path had - previously the host locked the GPU out entirely whenever
+ * detectRho > 0, so the "GPU" checkbox had no effect at the default
+ * rho = 1.02.  Side effect: 96% of bins pass the test and skip
+ * Durand-Kerner entirely - the test costs O(p^2), the iteration
+ * O(40 p^2). */
 static int xo_rho_test(
   const xo_solv *ar, const xo_solv *ai, const int order, const xo_solv rho) {
   xo_solv ur[XO_ORDER_MAX + 1], ui[XO_ORDER_MAX + 1];
@@ -327,7 +326,7 @@ static int xo_rho_test(
     const xo_solv km = kr * kr + ki * ki;
 
     if (km >= (xo_solv)1)
-      return 0; /* Box-Bedingung verletzt: Wurzel ausserhalb rho */
+      return 0; /* box condition violated: root outside rho */
 
     const xo_solv den = (xo_solv)1 - km;
     xo_solv nr[XO_ORDER_MAX + 1], ni[XO_ORDER_MAX + 1];
@@ -359,28 +358,29 @@ static int xo_rho_test(
  * This is the kernel the whole exercise is about: it is O(p^3) and it is
  * where the CPU runs out of room.
  *
- * SOLVE-TAP (optional, tap != 0): eine Zeile je Bin zum Zuschauen,
+ * SOLVE TAP (optional, tap != 0): one row per bin for observability,
  *
- *     [ max|z| , Zweig , Re z0 , Im z0 , Re z1 , Im z1 , ... ]
+ *     [ max|z| , branch , Re z0 , Im z0 , Re z1 , Im z1 , ... ]
  *
- * also 2 + 2*order Floats.  Alles VOR dem Deckeln: mit der Schwelle als
- * Farbbruch bzw. als Kreis zeigt die Anzeige genau die Pole, die gegen
- * den Deckel liefen; NACH dem Deckeln laegen sie alle exakt auf der
- * Schwelle und waeren von den knapp darunter liegenden nicht mehr zu
- * unterscheiden.  Wo gar keine Wurzeln entstehen (Detektor bestanden,
- * Gauss singulaer), steht -1 als Radius und NAN als Pol - eine eigene
- * Kategorie, keine gefaelschte Zahl (eine Null waere ein Pol im
- * Ursprung, also eine Behauptung).
+ * i.e. 2 + 2*order floats.  Everything is captured BEFORE clamping:
+ * with the threshold drawn as a color break or a circle, the display
+ * shows exactly the poles that ran up against the clamp; AFTER
+ * clamping they would all sit exactly on the threshold and be
+ * indistinguishable from the ones just below it.  Where no roots are
+ * produced at all (detector passed, or the Gaussian elimination was
+ * singular), the radius is -1 and the pole is NAN - a distinct
+ * category, not a faked number (a zero would read as a pole at the
+ * origin, i.e. a false claim).
  * ------------------------------------------------------------------- */
-#define XO_TAP_SINGULAR 0.0f   /* Gauss nicht endlich, Koeffizienten genullt */
-#define XO_TAP_DETECTOR 1.0f   /* rho-Test bestanden, roh durchgereicht */
-#define XO_TAP_ROTATOR  2.0f   /* Ordnung 1 */
-#define XO_TAP_QUADRAT  3.0f   /* Ordnung 2, geschlossene Form */
+#define XO_TAP_SINGULAR 0.0f   /* Gaussian elimination non-finite, coefficients zeroed */
+#define XO_TAP_DETECTOR 1.0f   /* rho test passed, raw coefficients passed through */
+#define XO_TAP_ROTATOR  2.0f   /* order 1 */
+#define XO_TAP_QUADRAT  3.0f   /* order 2, closed form */
 #define XO_TAP_DK       4.0f   /* Durand-Kerner */
-#define XO_TAP_SCHUR    5.0f   /* wurzelfreier Pfad (im GPU-Build tot) */
-#define XO_TAP_NONFIN   6.0f   /* mindestens eine Wurzel nicht endlich */
+#define XO_TAP_SCHUR    5.0f   /* root-free path (dead in the GPU build) */
+#define XO_TAP_NONFIN   6.0f   /* at least one root non-finite */
 
-/* Zeilenbreite haengt an der Ordnung, die der Kernel ohnehin kennt. */
+/* Row width depends on the order, which the kernel already knows. */
 #define XO_TAP_ROW (tap + (size_t)bin * (2 + 2 * order))
 
 #define XO_TAP(mz_, path_)                                              \
@@ -393,9 +393,9 @@ static int xo_rho_test(
     }                                                                   \
   } while (0)
 
-/* Pol k, VOR dem Deckeln.  Muss VOR jeder Aenderung an z gerufen
-   werden - der Sinn der Anzeige ist ja, zu sehen, wohin der Fit
-   WOLLTE, bevor die Kappe ihn zurueckholt. */
+/* Pole k, BEFORE clamping.  Must be called BEFORE any change to z -
+   the whole point of the display is to see where the fit WANTED to
+   go, before the clamp pulls it back. */
 #define XO_TAP_ROOT(k_, re_, im_)                                       \
   do {                                                                  \
     if (tap != 0) {                                                     \
@@ -416,17 +416,17 @@ __kernel void xo_solve(
   const int binFirst,        /* stripe start - a rolling slice per call */
   const int binLast,
   const float clampT,        /* root-clamp trigger; engine: 0.9 default */
-  const float detRho,        /* > 0 = Detektor-Modus, 0 = klassisch */
-  __global float *tap) {     /* [nbins][2] Solve-Tap, 0 = aus */
+  const float detRho,        /* > 0 = detector mode, 0 = classic */
+  __global float *tap) {     /* [nbins][2] solve tap, 0 = off */
   const int idx = XO_GID(0);
   const int bin = binFirst + idx;
 
   if (bin >= binLast || bin >= nbins)
     return;
 
-  /* Polplaetze vorsorglich leeren: die Zeile ueberlebt den Durchlauf,
-     und ein Zweig, der keine Wurzeln rechnet, wuerde sonst die des
-     VORIGEN Durchlaufs stehen lassen - das saehe aus wie ein Ergebnis. */
+  /* Clear the pole slots preemptively: the row survives across calls,
+     and a branch that computes no roots would otherwise leave the
+     PREVIOUS call's roots standing - which would look like a result. */
   if (tap != 0)
     for (int k = 0; k < order; k++) {
       XO_TAP_ROOT(k, NAN, NAN);
@@ -459,8 +459,9 @@ __kernel void xo_solve(
         piv = r;
       }
     }
-    /* Engine: 1e-300.  In float unterlaeuft das Literal zu 0, der
-     * Abbruch entfaellt dann - exakt wie eine float-Engine es taete. */
+    /* Engine: 1e-300.  In float this literal underflows to 0, so the
+     * bail-out never triggers there - exactly what a float engine
+     * would do. */
     if (best < (xo_real)1e-300) {
       for (int k = 0; k < order; k++) {
         coef[(size_t)bin * order * 2 + 2 * k] = 0.0f;
@@ -517,20 +518,20 @@ __kernel void xo_solve(
     }
   }
 
-  /* DETEKTOR-MODUS.  Reihenfolge exakt wie in SolveBin: erst der
-   * rho-Test auf den ROHEN Gauss-Koeffizienten, dann Ordnung 1, dann
-   * Schur.  Bestanden -> Koeffizienten unveraendert durchreichen, also
-   * kein Durand-Kerner und kein Rebuild: die gefittete Huellkurve jeder
-   * Mode bleibt erhalten.  Ordnung 1 nimmt daran nicht teil (der
-   * Rotator hat nur eine Wurzel und seine eigene Normierung). */
+  /* DETECTOR MODE.  Order exactly as in SolveBin: first the rho test
+   * on the RAW Gaussian-elimination coefficients, then order 1, then
+   * Schur.  Passed -> pass the coefficients through unchanged, so no
+   * Durand-Kerner and no rebuild: each mode's fitted envelope is
+   * preserved.  Order 1 doesn't participate in this (the rotator has
+   * only one root and its own normalization). */
   if (detRho > 0.0f && order >= 2
       && xo_rho_test(ar, ai, order, (xo_solv)detRho)) {
     for (int k = 0; k < order; k++) {
       coef[(size_t)bin * order * 2 + 2 * k] = (float)ar[k];
       coef[(size_t)bin * order * 2 + 2 * k + 1] = (float)ai[k];
     }
-    /* Der Test BEWEIST nur "alle Wurzeln innerhalb rho", er berechnet
-     * keine - hier gibt es keinen Radius zu melden. */
+    /* The test only PROVES "all roots inside rho", it doesn't compute
+     * any - there's no radius to report here. */
     XO_TAP(-1.0f, XO_TAP_DETECTOR);
     return;
   }
@@ -559,14 +560,14 @@ __kernel void xo_solve(
   if (order == 1) {
     const xo_real mm = sqrt(ar[0] * ar[0] + ai[0] * ai[0]);
 
-    XO_TAP_ROOT(0, ar[0], ai[0]);   // vor der Normierung gleich darunter
+    XO_TAP_ROOT(0, ar[0], ai[0]);   // before the normalization right below
     if (mm > (xo_real)clampT) {
       ar[0] /= mm;
       ai[0] /= mm;
     }
     coef[(size_t)bin * order * 2] = (float)ar[0];
     coef[(size_t)bin * order * 2 + 1] = (float)ai[0];
-    /* Beim Rotator IST der Koeffizientenbetrag der Polradius. */
+    /* For the rotator, the coefficient magnitude IS the pole radius. */
     XO_TAP(mm, XO_TAP_ROTATOR);
     return;
   }
@@ -686,13 +687,13 @@ __kernel void xo_solve(
       tapPath = XO_TAP_NONFIN;
     } else if (
       detRho > 0.0f ? (mm > (xo_root)detRho) : (mm > (xo_root)clampT)) {
-      /* Detektor-Modus: auf rho DECKELN (Budget), klassisch: auf 1.0. */
+      /* Detector mode: CLAMP to rho (budget); classic mode: to 1.0. */
       const xo_root tgt = detRho > 0.0f ? (xo_root)detRho : (xo_root)1;
 
       zr[k] *= tgt / mm;
       zi[k] *= tgt / mm;
     }
-    /* VOR dem Deckeln gemessen - siehe Kopfkommentar. */
+    /* Measured BEFORE clamping - see the header comment above. */
     if (isfinite(mm) && (float)mm > tapMax)
       tapMax = (float)mm;
     if (roots != 0) {

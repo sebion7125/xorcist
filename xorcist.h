@@ -47,13 +47,12 @@ enum {
   XORCIST_PV_2K = 1,
   XORCIST_PV_4K = 2,
   XORCIST_PV_8K = 3,
-  /* ANGEHAENGT, nicht einsortiert: die drei Werte oben stecken in
-     gespeicherten GO-Einstellungen.  1024 Samples = 21 ms Fenster,
-     47 Hz Bins - zu grob, um Teiltoene eines Akkords zu trennen, aber
-     mit der vierfachen Zeitaufloesung von 4k.  Zum Ausmessen der Frage,
-     ob eine hoehere Prony-Ordnung die fehlende Frequenzaufloesung
-     zurueckholt (Nutzer, 07.08.).  Braucht Puffer 128: der Analyse-Hop
-     muss nfft/4 = 256 teilen. */
+  /* Appended rather than reordered: the three values above are baked
+     into saved host settings.  1024 samples = 21 ms frame, 47 Hz bins -
+     too coarse to separate a chord's partials, but four times the time
+     resolution of PV 4k.  Exists to test whether a higher Prony order
+     can make up for the missing frequency resolution.  Needs a period
+     size of 128: the analysis hop must divide nfft/4 = 256. */
   XORCIST_PV_1K = 4
 };
 
@@ -287,99 +286,105 @@ typedef struct {
    * 4096-sample debounce.  Transparency on stationary material:
    * -26 to -39 dB. */
   int patchTransients;
-  /* 1 = ZWEI-KETTEN-HYBRID (Nutzer-Entwurf 07.08.): eine kurze
-   * 1k-Zweitkette laeuft dauerhaft warm mit.  Feuert der
-   * Einsatz-Detektor, bekommen die betroffenen 94-Hz-Baender in BEIDEN
-   * Ketten frische Normalgleichungen - ihr Gedaechtnis reicht damit nie
-   * weiter zurueck als der Anschlag, und die Ordnung klettert mit den
-   * verfuegbaren Tupeln (Leiter).  Waehrenddessen spielt die kurze
-   * Kette diese Baender; sobald der frische Fit der LANGEN Kette
-   * hybHandOrder traegt, wird zurueckgegeben (weich ueber ~3 Perioden).
-   * Braucht eine Puffergroesse, die 256 teilt, und einen Rahmen > 1k. */
+  /* 1 = two-chain hybrid mode: a short secondary 1k chain runs
+   * continuously alongside the main one, kept warm.  When the onset
+   * detector fires, the affected ~94 Hz bands get fresh normal
+   * equations in BOTH chains, so their memory never reaches further
+   * back than the onset, and the order climbs as real tuples become
+   * available (a ladder).  While that happens, the short chain plays
+   * those bands; once the LONG chain's fresh fit reaches hybHandOrder,
+   * control is handed back (smoothed over ~3 periods).  Needs a period
+   * size that divides 256, and an analysis frame bigger than 1k. */
   int hybrid;
-  /* Deckel der 1k-Ordnungsleiter, 0 = eingebaute 6.  Ordnung p wird
-   * genutzt, sobald p + 2 Perioden seit dem Reset vergangen sind. */
+  /* Cap of the short chain's order ladder; 0 = the built-in 6.  Order p
+   * is used once p + 2 periods have passed since the reset. */
   int hybShortCap;
-  /* Uebergabe an die lange Kette, wenn deren frischer Fit diese Ordnung
-   * traegt; 0 = eingebaute 6.  Bei 2k faellt (6+2) Rasterpunkte exakt
-   * mit dem Moment zusammen, ab dem kein Analyserahmen mehr Signal von
-   * vor dem Anschlag enthaelt (42,7 ms). */
+  /* Order the long chain's fresh fit must reach before hand-back; 0 =
+   * the built-in 6.  At PV 4k, (6 + 2) grid points lands exactly on the
+   * moment no analysis frame still contains pre-onset signal
+   * (42.7 ms). */
   int hybHandOrder;
-  /* 1 = Akkumulator-Reset beim Anschlag (urspruenglicher Entwurf:
-   * Gedaechtnis reicht nie hinter den Anschlag).  GEMESSEN SCHAEDLICH
-   * als Vorgabe: +6.5 dB NMR allein durch den Schaden an der langen
-   * Kette.  0 (Vorgabe) = beide Ketten laufen kontinuierlich, der
-   * Detektor schaltet nur die Bandmaske. */
+  /* 1 = reset the accumulator on note onset (the original design:
+   * memory should never reach back past the onset).  MEASURED HARMFUL
+   * as a default - costs roughly +6.5 dB NMR on its own, from the
+   * damage this does to the long chain's state.  0 (the default) =
+   * both chains keep running continuously; the detector only switches
+   * which one is heard per band. */
   int hybReset;
-  /* 1 = beim Einsatz schalten ALLE Baender auf die kurze Kette statt
-   * nur der steigenden.  Gemessen 08.08.: die Teilauswahl reisst
-   * Teiltoene zwischen den Ketten auseinander - 200-ms-Haltetest max
-   * +16.7 dB NMR mit Auswahl, +7.05 mit allen Baendern. */
+  /* 1 = on an onset, switch ALL bands to the short chain instead of
+   * only the rising ones.  Measured: switching only a subset tears
+   * partials apart between the two chains - worst case +16.7 dB NMR
+   * over a 200 ms held-note test with partial selection, vs. +7.05 dB
+   * when all bands switch together. */
   int hybAllBands;
-  /* 1 = RESIDUEN-WAEHLER (Experiment, GEMESSEN GESCHEITERT 08.08.):
-   * jedes Band spielt die Kette mit kleinerem relativem
-   * Ein-Schritt-Vorhersagefehler.  Der misst aber NACHFUEHRUNG, nicht
-   * EXTRAPOLATION ueber den Verdeckungshorizont - die kurze Kette
-   * gewinnt ihn auch auf Plateaus (folgt der Schwebung) und der
-   * Waehler schaltete 3935x fern der Einsaetze (+6.4 dB NMR).  0 =
-   * Vorgabe, detektor-getriebene Umschaltung. */
+  /* 1 = residual-based chain chooser (experiment, measured to fail):
+   * each band plays whichever chain currently has the smaller relative
+   * one-step prediction error.  Problem: that metric measures TRACKING,
+   * not EXTRAPOLATION across the concealment horizon - the short chain
+   * wins it even on plateaus, where it merely follows the beating - so
+   * the chooser kept switching far from actual onsets (measured 3935
+   * spurious switches, +6.4 dB NMR).  0 = the default, detector-driven
+   * switching instead. */
   int hybChooser;
-  /* 1 = 512er-VORSTUFE: die Breite auf 512er-Rahmen (13-29 ms nach dem
-   * physischen Anschlag, Augen-Paritaet) schaltet die steigenden
-   * Baender VORLAEUFIG auf die kurze Kette; bestaetigt der 2k-Detektor
-   * nicht binnen XO_PRE_TTL (16) Perioden, wird zurueckgezogen - die
-   * lange Kette wurde nie angetastet und spielt sofort wieder voll.
-   * Schwelle XO_PRE_ON (0.41), hauchduenn kalibriert - deshalb das
-   * Rueckzugsnetz. */
+  /* 1 = 512-sample pre-stage: on a 512-sample frame (13-29 ms after the
+   * physical onset), rising bands switch to the short chain
+   * PROVISIONALLY; if the 2k detector has not confirmed the onset
+   * within XO_PRE_TTL (16) periods, the switch is withdrawn and the
+   * long chain - never actually disturbed - resumes immediately at
+   * full quality.  The trigger threshold (XO_PRE_ON, 0.41) is tuned
+   * very finely, which is why this safety net exists. */
   int hybPre;
-  /* 1 = SIMPLER Detektor-Modus zum A/B-Hoeren: exakt die erste
-   * Hybrid-Erkennung ohne allen spaeteren Schnickschnack - 2k-Breite
-   * mit Kandidat, Schaltlatte und Spleiss-Veto, Wiedereintritts-Sperre
-   * 48 Perioden.  KEINE 512er-Vorstufe, kein Wechselwunsch, kein
-   * Per-Band-Urteil, kein Lautstaerke-Tor, kein Rueckzug. */
+  /* 1 = simplified detector mode for A/B listening: exactly the first,
+   * minimal onset-detection logic with none of the later refinements -
+   * 2k-wide candidate test, switch latch, splice veto, and a 48-period
+   * re-entry lockout.  No 512-sample pre-stage, no chain chooser, no
+   * per-band verdict, no level gate, no withdrawal. */
   int hybSimple;
-  /* Warmhalte-Ordnung der 1k-Kette (Vorgabe 2): warm laeuft nur die
-   * STARTordnung (1/7 der Update-Kosten von Ordnung 6); ab der
-   * Schaltung akkumuliert ein frischer Satz bei voller Deckelordnung
-   * und die Leiter klettert mit echten Tupeln.  0 = Vollbetrieb wie
-   * bisher (warm bei Deckelordnung). */
+  /* Order the short chain idles at while warm (default 2): only the
+   * START order runs continuously (1/7th the update cost of order 6);
+   * once switched on, a fresh accumulator climbs to the full cap order
+   * as real tuples arrive.  0 = run it at full cap order even while
+   * idle, as before. */
   int hybWarmOrder;
-  /* RESIDUEN-TOR des Simpel-Detektors, ANGEHAENGT (die Reihenfolge darueber
-     steckt im ctypes-Layout des Labors).  0 = aus.
-     Ein Band zaehlt nur als steigend, wenn sein eigener Vorhersagefehler
-     ueber diesem Wert liegt - die Breite wird aus den so bestaetigten
-     Baendern gebildet.  Trennt, was der Pegel nicht trennt: eine Schwebung
-     setzt die lange Kette fort, ein Anschlag nicht.  Gemessen am D-Dur-
-     Material bei 6000 Luecken/min: 0.02 raeumt alle drei Plateau-
-     Fehlzuendungen ab, kostet zwei von sechs Einsaetzen und verbessert
-     trotzdem jedes Mass (Mittel -18.08 -> -18.28 dB, schlimmster Fall
-     15.61 -> 15.05, an den Einsaetzen -13.66 -> -13.81) - eine
-     Fehlzuendung im Plateau kostet eben viel mehr als ein verpasster
-     Anschlag.  decay: Abklingrate des Band-Maximums je Periode
-     (0 = Vorgabe 0.85, rund acht Perioden Gedaechtnis); der Momentanwert
-     allein verpasst schwache Einsaetze, deren Residuum erst nach der
-     Breitenschwelle kreuzt. */
+  /* Residual gate for the simplified detector, appended here rather
+   * than reordered (the field order above is baked into the lab's
+   * ctypes layout).  0 = off.
+   * A band only counts as rising if its own prediction error exceeds
+   * this threshold - the onset width is built from the bands that pass
+   * this test.  It separates what level alone cannot: a beat pattern
+   * keeps the long chain going, a real onset does not.  Measured on a
+   * D-major-chord test signal at 6000 misses/min: 0.02 removes all
+   * three plateau false triggers seen without it, costs 2 of 6 onsets,
+   * and still improves every aggregate measure (mean -18.08 ->
+   * -18.28 dB, worst case 15.61 -> 15.05, at onsets -13.66 -> -13.81) -
+   * a false trigger on a plateau costs far more than a missed onset.
+   * decay: per-period decay rate of each band's running maximum (0 =
+   * default 0.85, roughly eight periods of memory); the instantaneous
+   * value alone misses weak onsets whose residual only crosses the
+   * gate after the fact. */
   float detResGate;
   float detResDecay;
-  /* 1 = Naht-Anker aus dem HINDCAST: Versatz direkt gemessen als
-     Schatten[-1] gegen das letzte echte Sample (beide Ketten sammeln ihr
-     Vor-Grenz-Sample ein), Exponentiale ein Sample nach vorn.  Der
-     Burg-Fit des Nahtpfads entfaellt dann komplett.  0 = Burg-v0
-     (Vorgabe).  Gemessen 12.08.2026 (D-Dur, 6000/min, 2k/O8): ohne
-     Hybrid gleichwertig (-17,99 = -17,99), mit Hybrid Einsaetze
-     identisch, Rest 0,14 dB Plateau; Burg-Pfad kostete 4,3 us je Runde.
-     Umgebungsstart XO_V0_SHADOW=1 setzt nur die Vorgabe (Harness). */
+  /* 1 = derive the seam anchor from hindcast: the offset is measured
+   * directly as shadow[-1] against the last real sample (both chains
+   * keep their pre-boundary sample), then the decaying exponential is
+   * advanced one sample forward.  This removes the seam path's Burg
+   * fit entirely.  0 = the default Burg v0 path.  Measured: equivalent
+   * to the default without hybrid mode active; with hybrid mode,
+   * onsets are identical and the rest of the signal differs by about
+   * 0.14 dB; the Burg path itself costs about 4.3 us per round. */
   int v0Hindcast;
-  /* 1 = SOLVE-MITSCHRIFT (nur Labor, nur zusammen mit gpu=1): der Kernel
-     legt je Bin ab, was er getan hat - groesster Polradius VOR dem
-     Deckeln, genommener Zweig, und alle Pole selbst -, und je
-     vollstaendigem Bin-Durchlauf von Kanal 0 wandert eine Momentaufnahme
-     in einen Ring.  Abzuholen mit Xorcist_solveTapRead.
-
-     KOSTET ZEIT: der Streifen muss nach jedem Kernelstart blockierend
-     zurueckgelesen werden, was die Warteschlange serialisiert.  Jede
-     Zeitmessung mit gesetztem Haken ist wertlos.  Das Ergebnis selbst
-     bleibt unveraendert - der Tap schreibt nur mit. */
+  /* 1 = solve trace recording (lab/diagnostic use only, requires
+   * gpu=1): the kernel records, per bin, what it did - the largest
+   * pole radius before clamping, which branch was taken, and every
+   * pole itself - and after each complete pass over channel 0's bins,
+   * one snapshot moves into a ring buffer.  Retrieve it with
+   * Xorcist_solveTapRead.
+   *
+   * COSTS TIME: the trace must be read back from the device, blocking,
+   * after every kernel launch, which serialises the queue.  Any timing
+   * measurement taken with this flag set is meaningless.  The result
+   * itself (the concealment output) is unaffected - the tap only
+   * records alongside it. */
   int solveTap;
 } XorcistTuning;
 
@@ -583,61 +588,66 @@ uint64_t Xorcist_backfillCount(void);
    the all-roots-inside-rho test, out of bins tested.  Reading RESETS. */
 void Xorcist_rhoStats(uint64_t *pFails, uint64_t *pTests);
 
-/* Solve-Streifen seit dem letzten Aufruf, getrennt nach Geraet und CPU
-   (Lesen SETZT ZURUECK).  Ein gesetztes GPU-Haekchen beweist nichts: der
-   Replica-Pfad und Schur bleiben CPU, ein gescheitertes Geraet faellt
-   dauerhaft zurueck.  Wer die Einstellung anzeigt, soll die Wirkung
-   anzeigen koennen. */
+/* Solve rounds since the last call, split by device vs. CPU (reading
+   RESETS both).  A nonzero GPU count proves nothing on its own: the
+   replica path and Schur mode always stay on the CPU, and a device
+   that fails once falls back to the CPU permanently.  A host that
+   exposes the gpu setting should also be able to show whether it is
+   actually having any effect. */
 void Xorcist_gpuStats(uint64_t *pOnDevice, uint64_t *pOnCpu);
 
-/* Nebenlaeufigkeits-Messung fuer Wirte, die predictBegin/predictChannel/
-   predictEnd auf EIGENEN Threads fahren (Lesen SETZT ZURUECK).  Ein
-   einthreadiger Aufrufer - das Labor - liest hier zwingend 0/0.
+/* Concurrency diagnostics for hosts that run predictBegin/
+   predictChannel/predictEnd on their OWN worker threads (reading
+   RESETS both).  A single-threaded caller - such as an offline tool -
+   will always read 0/0 here.
 
-   Beide Zahlen sind seit dem Einfrieren des Rundenfensters (10.08.2026)
-   DIAGNOSE, kein Schaden mehr: sie sagen, wie stark der Wirt verschraenkt,
-   nicht wie viel er verliert.
+   Both counters are diagnostic only, not an indication of lost
+   quality: they report how much a host's scheduling overlaps with
+   Xorcist's own round window, not how much audio quality that costs.
 
-   staleDiscards: Runden, waehrend derer der Ring weitergeschrieben wurde.
-     Bis zum Einfrieren wurden sie verworfen (daher der Name) - heute
-     werden sie mit ihrem eigenen, festgehaltenen Fenster zu Ende gerechnet
-     und veroeffentlicht.
-   lateSlices:    Verdeckungen aus einer Scheibe > 0, OHNE dass die
-     Vorperiode selbst verdeckt war.  Heisst: die frische Runde war beim
-     Bail noch nicht fertig, gespielt wurde die vorige - inhaltlich
-     korrekt, aber ein Hinweis darauf, dass die Rundenlaufzeit an die
-     Periodendauer stoesst. */
+   staleDiscards: rounds during which the history ring was appended to
+     while the round was still in flight.  They are still completed and
+     published against their own frozen analysis window rather than
+     discarded.
+   lateSlices: concealments drawn from a slice index > 0 without the
+     previous period itself having been concealed.  This means the
+     fresh round was not yet finished when a bail-out happened, so the
+     previous round's result was played instead - correct output, but
+     a sign that the round's compute time is pushing against the
+     period length. */
 void Xorcist_raceStats(uint64_t *pStaleDiscards, uint64_t *pLateSlices);
 
-/* Ursachen-Zuordnung der spaeten Scheiben (Lesen SETZT ZURUECK).
-   afterSkip: wie viele der obigen lateSlices binnen zwei Perioden nach
-     einem Besetzt-Fall des Oeffnungswaechters lagen (predictBegin traf
-     eine laufende Runde).  afterSkip == lateSlices beweist die Kette
-     "Oeffnung verpasst -> Anker blieb zurueck"; afterSkip << lateSlices
-     heisst, der Anker bleibt aus einem ANDEREN Grund zurueck.
-   maxSlice: groesste dabei gespielte Scheibennummer.  1 = genau eine
-     Runde verpasst, mehr = Serienausfall der Oeffnungen. */
+/* Root-cause breakdown of the late slices above (reading RESETS both).
+   afterSkip: how many of the lateSlices above occurred within two
+     periods of predictBegin() finding a round already in progress (a
+     "busy" result).  afterSkip == lateSlices confirms the chain "open
+     call was skipped -> the anchor fell behind"; afterSkip much
+     smaller than lateSlices means the anchor is falling behind for
+     some OTHER reason.
+   maxSlice: the largest slice index actually played.  1 = exactly one
+     round was missed; higher values mean rounds are falling behind
+     repeatedly. */
 void Xorcist_lateStats(uint64_t *pAfterSkip, uint64_t *pMaxSlice);
 
-/* ---- Stufenmessung ---------------------------------------------------
-   Wohin geht die Rundenlaufzeit?  AUS per Vorgabe (die Uhr kostet ~20 ns
-   je Abfrage, und der Solve laeuft pro Bin); XO_PROFILE=1 in der Umgebung
-   oder Xorcist_setProfiling(1) schaltet scharf.
+/* ---- Stage timing -----------------------------------------------------
+   Where does a round's compute time go?  OFF by default (the clock
+   itself costs ~20 ns per query, and the solve runs per bin);
+   XO_PROFILE=1 in the environment, or Xorcist_setProfiling(1), turns it
+   on.
 
-   Stufen in dieser Reihenfolge: Analyse, Detektor 4k, Hybrid 1k,
-   AR-Akkumulation, AR-Solve, davon Durand-Kerner, Synthese, Cap + Naht.
-   "davon Durand-Kerner" ist in "AR-Solve" ENTHALTEN, nicht daneben - er
-   laeuft nur, wo Ordnung >= 3 ist, der rho-Test durchfaellt und Schur aus
-   ist, also in einem Bruchteil der Bins.
+   Stages, in this order: analysis, 4k detector, 1k hybrid, AR
+   accumulation, AR solve (which INCLUDES Durand-Kerner, not a sibling
+   stage - it only runs where order >= 3, the rho test fails, and Schur
+   mode is off, so only on a fraction of bins), synthesis, cap + seam.
 
-   Xorcist_stageStats liefert Nanosekunden und Aufrufzahlen und SETZT
-   BEIM LESEN ZURUECK, damit ein Wirt genau ein Zeitfenster einrahmen
-   kann. */
-/* Diagnoseschalter der Umgebung, die GERADE abweichen, als
-   "NAME=WERT NAME=WERT" - leer, wenn alles auf Vorgabe steht.  Damit ein
-   Wirt ANZEIGEN kann, was wirkt, statt dass nach einem A/B geraten werden
-   muss, ob die Variable ueberhaupt angekommen ist.  Der Zeiger bleibt
-   gueltig, die Umgebung wird einmalig beim ersten Aufruf gelesen. */
+   Xorcist_stageStats reports nanoseconds and call counts and RESETS
+   both on read, so a host can bracket exactly one time window. */
+/* Environment diagnostic overrides currently in effect, as
+   "NAME=VALUE NAME=VALUE" - empty if everything is at its default.
+   Lets a host DISPLAY what is actually active, instead of having to
+   guess from an A/B test whether an environment variable was picked up
+   at all.  The returned pointer stays valid; the environment is read
+   once, on the first call. */
 const char *Xorcist_diagOverrides(void);
 
 void Xorcist_setProfiling(int on);
@@ -646,44 +656,49 @@ unsigned Xorcist_stageCount(void);
 const char *Xorcist_stageName(unsigned index);
 void Xorcist_stageStats(uint64_t *pNs, uint64_t *pCalls, unsigned maxStages);
 
-/* ZUENDUNGEN des Transientendetektors seit dem letzten Aufruf (Lesen
-   SETZT ZURUECK).  Auf gehaltenem Klang gehoert hier eine Null hin: das
-   Kriterium ist ein reines Verhaeltnis (Bandenergie gegen dieselbe acht
-   Perioden frueher) und damit pegelunabhaengig - nachgemessen ueber 100
-   dB, gleiche Zahl.  Was den Detektor bei hoher Lueckendichte trotzdem
-   taeuscht, sind die eigenen WIEDEREINSTIEGE; das Spleiss-Veto reicht
-   nur 3 Perioden zurueck, sein 4k-Fenster aber 32.
-   `tentative` zaehlt die vorlaeufigen Zuendungen der 512er-Vorstufe,
-   die widerrufen werden koennen (GO faehrt sie nicht). */
-/* JE KANAL: Rueckgabe = wie viele der 256 Routing-Baender gerade etwas
-   tragen (mehr als -60 dB unter dem lautesten Band des Kanals), pOnsets =
-   Zuendungen dieses Kanals seit Start (NICHT zuruecksetzend).
+/* Transient-detector TRIGGERS since the last call (reading RESETS).  On
+   held material this should read zero: the detection criterion is a
+   pure ratio (a band's energy against its own level eight periods
+   earlier), so it is level-independent by construction - verified
+   across a 100 dB range, same count either way.  What CAN still fool
+   the detector at a high miss rate is its own RE-ENTRIES: the splice
+   veto only looks back 3 periods, while its 4k analysis window spans
+   32.
+   `tentative` counts the provisional triggers from the 512-sample
+   pre-stage that can still be withdrawn (not used by GrandOrgue). */
+/* PER CHANNEL: return value = how many of the 256 routing bands
+   currently carry anything (within 60 dB of that channel's loudest
+   band); pOnsets = onset triggers for this channel since start (does
+   NOT reset on read).
 
-   Warum das die entscheidende Zahl ist: das Kriterium des Detektors ist
-   ein Verhaeltnis, und in einem leeren Band ist Faktor zwei geschenkt -
-   dort steht nur der eigene Vorhersagefehler.  Ein breitbandiger Kanal
-   traegt das problemlos, ein duenn besetzter zuendet im Dauerlauf
-   (gemessen: 86 belegte Baender 0 Zuendungen, 3 belegte 228).  Ein
-   Stereo-Downmix kann das nie zeigen, weil Summieren Baender fuellt. */
+   Why this is the number that matters: the detector's criterion is a
+   ratio, and in an empty band a factor of two is free - there is
+   nothing there but the predictor's own error.  A broadband channel
+   tolerates that without issue; a sparsely occupied one keeps
+   triggering spuriously during steady playback (measured: 86 occupied
+   bands, 0 spurious triggers; 3 occupied bands, 228).  A stereo
+   downmix can never show this problem, because summing channels fills
+   in bands that would otherwise be empty. */
 unsigned Xorcist_detectorPerChannel(unsigned ch, uint64_t *pOnsets);
 
 void Xorcist_onsetStats(uint64_t *pOnsets, uint64_t *pTentative);
 
-/* Abtastwert-Positionen der letzten Zuendungen, aelteste zuerst, damit
-   ein Wirt sie in seinen Verlauf ZEICHNEN kann.  Lesen setzt NICHT
-   zurueck (ein Zeichner darf jederzeit neu malen); der Ring haelt die
-   letzten 256 Ereignisse.  Rueckgabe: wie viele geschrieben wurden. */
+/* Sample positions of the most recent onset triggers, oldest first, so
+   a host can PLOT them against its own timeline.  Reading does NOT
+   reset the log (so a display can redraw at any time); the ring holds
+   the last 256 events.  Return value: how many were written. */
 unsigned Xorcist_onsetLog(uint64_t *pOut, unsigned maxEvents);
 
-/* Hybrid-WIRKUNG seit dem letzten Aufruf (Lesen SETZT ZURUECK):
-   Perioden mit aktiver Zweitkette, Perioden in denen der Haken gesetzt
-   war aber NICHTS tat (Basisrahmen 1k, oder Puffergroesse teilt 256
-   nicht), und die Summe der Band-Perioden, die die kurze Kette wirklich
-   gespielt hat. */
-/* Hybrid-Episoden als Tripel (startSample, endSample,
-   band | ordnung<<16 | nfft<<32), Kanal 0, neueste zuletzt, bis 4096.
-   Fuer die Spektrogramm-Anzeige: WELCHE Baender WANN mit der kurzen
-   Kette gerechnet wurden.  Lesen loescht nicht; hybLogClear schon. */
+/* Hybrid-mode EFFECT since the last call (reading RESETS all three):
+   periods during which the second chain was active, periods where the
+   flag was set but it did nothing (base frame is 1k, or the period
+   size does not divide 256), and the total band-periods the short
+   chain actually played. */
+/* Hybrid episodes as triples (startSample, endSample,
+   band | order<<16 | nfft<<32), channel 0 only, newest last, up to
+   4096 kept.  For a spectrogram display: WHICH bands were computed by
+   the short chain, and WHEN.  Reading does not clear the log;
+   hybLogClear does. */
 unsigned Xorcist_hybLog(uint64_t *pOut, unsigned maxEvents);
 void Xorcist_hybLogClear(void);
 
@@ -710,25 +725,26 @@ const char *Xorcist_version(void);
    runtime/device is available (the library then computes on the CPU). */
 const char *Xorcist_gpuDevice(void);
 
-/* ---- Solve-Mitschrift (Tuning-Feld solveTap) -------------------------
-   Ein Bild je vollstaendigem Bin-Durchlauf von Kanal 0.  Der Ring ist
-   nach SPEICHER gedeckelt (48 MB, 16..512 Bilder), weil ein Bild mit der
-   Ordnung waechst: es traegt je Bin den groessten Polradius, den Zweig
-   und ALLE Pole - jeweils vor dem Deckeln.
+/* ---- Solve trace (tuning field solveTap) ------------------------------
+   One frame per complete pass over channel 0's bins.  The ring is
+   capped by MEMORY (48 MB, 16..512 frames), because a frame grows with
+   the order: it carries, per bin, the largest pole radius, which
+   branch was taken, and ALL poles - each before clamping.
 
-   Info liefert, wie viele Bilder abrufbar sind, mit welcher Geometrie
-   sie geschrieben wurden, und wie viele insgesamt geschrieben wurden.
-   Ohne die ersten Zahlen laesst sich der Puffer fuer Read nicht
-   bemessen; pTotal ist fuer den Blick WAEHREND eines Laufs da (Differenz
-   zum letzten Blick = Zahl der neuen Bilder).  Aendern sich Bin-Zahl
-   oder Ordnung, faengt der Ring neu an - halbe Bilder zweier Geometrien
-   waeren nicht darstellbar.
+   The info call reports how many frames are available to read, the
+   geometry they were written with, and how many have been written in
+   total.  The first two numbers are needed to size the buffer passed
+   to Read; pTotal is meant for watching a live run (the difference
+   from the last call is the number of new frames).  If the bin count
+   or order changes, the ring starts over - frames from two different
+   geometries could not be represented together.
 
-   Read schreibt die JUENGSTEN maxFrames Bilder in zeitlicher Reihenfolge.
-   Jeder Zeiger darf 0 sein: pZ und pPath je maxFrames*nbins Floats,
-   pRoots maxFrames*nbins*order*2 (Re/Im, NAN wo der Zweig keine Wurzel
-   berechnet hat), pPos die Sampleposition je Bild.  Rueckgabe = wirklich
-   geschriebene Bilder.  Lesen loescht nicht; solveTapClear schon. */
+   Read writes the MOST RECENT maxFrames frames in chronological order.
+   Any pointer may be 0: pZ and pPath each need maxFrames*nbins floats,
+   pRoots needs maxFrames*nbins*order*2 (re/im, NAN where that branch
+   computed no root), pPos the sample position of each frame.  Return
+   value = frames actually written.  Reading does not clear the ring;
+   solveTapClear does. */
 void Xorcist_solveTapInfo(
   unsigned *pFrames, unsigned *pNbins, unsigned *pOrder, uint64_t *pTotal);
 unsigned Xorcist_solveTapRead(
@@ -736,18 +752,18 @@ unsigned Xorcist_solveTapRead(
   unsigned maxFrames);
 void Xorcist_solveTapClear(void);
 
-/* Die Analyse-Geometrie, die diese Instanz WIRKLICH rechnet - damit eine
-   Anzeige sie nicht nachbauen muss und dabei falsch liegt.
+/* The analysis geometry this instance is ACTUALLY using - so a display
+   does not have to reconstruct it itself and risk getting it wrong.
 
-   nfft   Rahmenlaenge des aktuellen Modus (1024/2048/4096/8192).
-   anaHop Sprung der STFT.  In der Regel EINE Audio-Periode, weil der
-          Rahmen dieser Periode genau der aeltere Rahmen ist, den die
-          naechste braucht; nur bei krummen Puffergroessen nfft/4.
-          Beruecksichtigt den Tuning-Ueberschreiber anaHop.
-   arHop  Abstand der Stuetzstellen, auf denen der AR-Fit sitzt
-          (max(nfft/8, Puffer)) - das ist die Zahl, die in den
-          Strategienamen "hop" heisst, NICHT der STFT-Sprung.
-   Jeder Zeiger darf 0 sein. */
+   nfft   Frame length of the current mode (1024/2048/4096/8192).
+   anaHop STFT hop size.  Normally ONE audio period, because this
+          period's frame is exactly the older frame the next one
+          needs; only an unusual period size falls back to nfft/4.
+          Reflects the anaHop tuning override if one is set.
+   arHop  Spacing of the grid points the AR fit sits on
+          (max(nfft/8, period size)) - this is the number meant by
+          "hop" in strategy names, NOT the STFT hop above.
+   Any pointer may be 0. */
 void Xorcist_analysisGeometry(
   const Xorcist *x, unsigned *pNfft, unsigned *pAnaHop, unsigned *pArHop);
 

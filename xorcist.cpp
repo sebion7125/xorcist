@@ -36,36 +36,38 @@
 
 #define XORCIST_VERSION "0.1.0"
 
-// ---- Stufenmessung ----------------------------------------------------
-// Wohin geht die Rundenlaufzeit wirklich?  Bis 10.08.2026 gab es dazu nur
-// zwei Zahlen (absorb gegen predict), und die Kostenmodelle der Messreihen
-// stammten von absorb - also OHNE Solve, Extrapolation, Synthese, Cap und
-// Naht, zusammen 77 % der Arbeit.  Hier wird jede Stufe einzeln gestoppt,
-// Durand-Kerner ausdruecklich getrennt, weil er nur in einem Teil der Bins
-// ueberhaupt laeuft (Ordnung >= 3, rho-Test durchgefallen, Schur aus).
+// ---- Stage timing -------------------------------------------------------
+// Where does a round's compute time actually go?  Previously there were
+// only two numbers for this (absorb vs. predict), and the absorb-based
+// cost model excluded the solve, extrapolation, synthesis, cap and seam
+// stages entirely - together 77% of the work.  Each stage is timed
+// separately here, with Durand-Kerner split out explicitly because it
+// only runs on a fraction of bins (order >= 3, rho test failed, Schur
+// mode off).
 //
-// AUS per Vorgabe: die Uhr kostet ~20 ns je Abfrage, und SolveBin laeuft
-// pro Bin.  XO_PROFILE=1 oder Xorcist_setProfiling(1) schaltet scharf.
+// OFF by default: the clock itself costs ~20 ns per query, and SolveBin
+// runs per bin.  XO_PROFILE=1 or Xorcist_setProfiling(1) turns it on.
 enum XoStage {
-  XO_ST_VORLAUF = 0,   // Aufmass vor dem Detektor - fast nichts
-  XO_ST_DETEKTOR,      // eigene 4k-Analyse des Simpel-Detektors
-  XO_ST_HYBRID,        // kurze 1k-Kette: Analyse, Tick, Synthese
-  XO_ST_ANALYSE,       // Vorwaerts-FFT, Freeze, Backfill, Naht-Routing
-  XO_ST_AR_AKKU,       // Normalgleichungen fortschreiben
-  XO_ST_AR_SOLVE,      // SolveBin gesamt (inkl. Durand-Kerner)
-  XO_ST_DURAND,        // NUR die Wurzeliteration
-  XO_ST_SYNTHESE,      // Extrapolation + iFFT + Ueberlappungsaddition
-  XO_ST_CAP_NAHT,      // Sicherheitsdeckel, Naht, Burg-Bruecke
+  XO_ST_VORLAUF = 0,   // lead-in before the detector - almost nothing
+  XO_ST_DETEKTOR,      // the simplified detector's own 4k analysis
+  XO_ST_HYBRID,        // short 1k chain: analysis, tick, synthesis
+  XO_ST_ANALYSE,       // forward FFT, freeze, backfill, seam routing
+  XO_ST_AR_AKKU,       // advancing the AR normal equations
+  XO_ST_AR_SOLVE,      // SolveBin as a whole (including Durand-Kerner)
+  XO_ST_DURAND,        // ONLY the root iteration
+  XO_ST_SYNTHESE,      // extrapolation + iFFT + overlap-add
+  XO_ST_CAP_NAHT,      // safety cap, seam, Burg bridge
   XO_ST_COUNT
 };
 
-// Namen sagen, was die Uhr WIRKLICH umschliesst.  Der erste Anlauf hiess
-// hier "Analyse" und mass 0.2 us - die FFT lag naemlich im naechsten
-// Block.  Eine Messung mit falscher Beschriftung ist schlimmer als keine.
+// Names describe what the clock ACTUALLY encloses.  An earlier pass
+// called this stage "analysis" and measured 0.2 us - the FFT itself was
+// sitting in the next block.  A mislabeled measurement is worse than
+// none at all.
 static const char *const s_StageNames[XO_ST_COUNT] = {
-  "Vorlauf", "Detektor 4k", "Hybrid 1k", "Analyse (FFT/Freeze)",
-  "AR-Akkumulation", "AR-Solve", "davon Durand-Kerner", "Synthese",
-  "Cap + Naht"};
+  "lead-in", "detector 4k", "hybrid 1k", "analysis (FFT/freeze)",
+  "AR accumulation", "AR solve", "of which Durand-Kerner", "synthesis",
+  "cap + seam"};
 
 static std::atomic<int> s_Profile{[] {
   const char *e = getenv("XO_PROFILE");
@@ -75,8 +77,8 @@ static std::atomic<int> s_Profile{[] {
 static std::atomic<uint64_t> s_StageNs[XO_ST_COUNT];
 static std::atomic<uint64_t> s_StageCalls[XO_ST_COUNT];
 
-// Kein RAII: mehrere Stufen liegen ineinander (Durand-Kerner in AR-Solve),
-// und ein Bereichsobjekt je Bin waere hier teurer als der Messwert.
+// Not RAII: stages nest (Durand-Kerner inside AR solve), and a scope
+// object per bin would cost more than the measurement itself.
 struct XoClock {
   std::chrono::steady_clock::time_point t0;
   bool on;
@@ -98,51 +100,51 @@ struct XoClock {
   }
 };
 
-// Diagnoseschalter: XO_NO_FREEZE=1 nimmt das Einfrieren des Rundenfensters
-// KOMPLETT zurueck - Schreibkopf und Periodennummer werden wieder live
-// gelesen, UND PredictEnd verwirft wieder, wenn der Ring waehrenddessen
-// weitergelaufen ist.  Das ist der Zustand vor dem 10.08.2026, auf Knopfdruck
-// und in derselben Binaerdatei, damit ein A/B im laufenden Wirt moeglich ist
-// statt einer Bisektion ueber Commits.  Ohne das Verwerfen waere es ein
-// dritter Zustand, den es nie gab.
+// Diagnostic switch: XO_NO_FREEZE=1 completely reverts the freezing of
+// the round window - the write head and period number are read live
+// again, AND PredictEnd goes back to discarding the round if the ring
+// advanced while it was in flight.  This reproduces the earlier
+// (pre-freeze) behaviour, in the same binary and on demand, so an A/B
+// test is possible in a live host instead of bisecting across commits.
+// Without the discard it would be a third state that never actually
+// existed.
 static const bool s_NoFreeze = [] {
   const char *e = getenv("XO_NO_FREEZE");
 
   return e && atoi(e) != 0;
 }();
 
-// Diagnoseschalter: XO_V0_LAST=1 ersetzt den Anker-Bezugswert v0 (Burgs
-// Einschritt-Vorhersage des NAECHSTEN Samples) durch das LETZTE echte
-// Sample vor der Luecke.  Nutzerfrage 12.08.2026: reicht das klanglich?
-// Der Unterschied ist der natuerliche Sample-zu-Sample-Fortschritt des
-// Signals - wer ihn in den Sprung einrechnet, injiziert ihn als
-// breitbandige Exponentiale in jede Naht.  Hier als Messknopf, nicht als
-// Meinung.
+// Diagnostic switch: XO_V0_LAST=1 replaces the anchor's reference value
+// v0 (Burg's one-step prediction of the NEXT sample) with the LAST real
+// sample before the gap.  The difference between the two is the
+// signal's natural sample-to-sample progress - leaving it out of the
+// anchor step injects it as a broadband exponential into every seam.
+// This exists to make that question measurable, not to assert an
+// answer.
 static const bool s_V0Last = [] {
   const char *e = getenv("XO_V0_LAST");
 
   return e && atoi(e) != 0;
 }();
 
-// Diagnoseschalter: XO_NO_SEAM=1 nimmt die GESAMTE Burg-Naht heraus -
-// kein Fit, kein v0, kein Anker-Abklingen, keine Bruecke.  Nutzerfrage
-// 12.08.2026: braucht die Naht-Maschinerie ab Spektral-Ordnung 2
-// ueberhaupt noch jemand (beide Kalibrierungen stammen aus der
-// Ordnung-1-Zeit)?  Der Schalter macht die Frage messbar, bevor
-// irgendwer Code abreisst.
+// Diagnostic switch: XO_NO_SEAM=1 removes the ENTIRE Burg seam path - no
+// fit, no v0, no anchor decay, no bridge.  Question this answers: once
+// spectral order >= 2 is in use, does the seam machinery (calibrated
+// back when only order 1 existed) still earn its keep?  This switch
+// makes that measurable before anyone removes code over it.
 static const bool s_NoSeam = [] {
   const char *e = getenv("XO_NO_SEAM");
 
   return e && atoi(e) != 0;
 }();
 
-// Hindcast-Anker (Nutzeridee 12.08.2026): Naht am gemessenen Versatz
-// verankern statt an der Vorhersage - seit dem Monitor-Schalter ein
-// TUNING-Feld (XorcistTuning::v0Hindcast, dort die volle Beschreibung);
-// XO_V0_SHADOW setzt nur noch den Startwert (Harness-Skripte).
+// Hindcast anchor: anchor the seam to the measured offset instead of to
+// the prediction - exposed as the tuning field XorcistTuning::v0Hindcast
+// (full description there); XO_V0_SHADOW here only sets the starting
+// value for harness scripts.
 //
-// XO_V0_ORDER=n (1..32) laesst den Burg-Fit dagegen nur bis Ordnung n
-// laufen - die "kleines Modell fuer EIN Sample"-Variante derselben Idee.
+// XO_V0_ORDER=n (1..32) instead limits the Burg fit to order n - the
+// "small model for just one sample" variant of the same idea.
 static const unsigned s_V0Order = [] {
   const char *e = getenv("XO_V0_ORDER");
   const int v = e ? atoi(e) : 0;
@@ -154,18 +156,18 @@ static inline bool XoProfiling() {
   return s_Profile.load(std::memory_order_relaxed) != 0;
 }
 
-// ---- AVX2-Kern der Extrapolation --------------------------------------
-// Dasselbe Muster wie GOSoundFader/GOSoundResampleBatch im Wirt: der
-// Kernel traegt target("avx2"), der Rest der Uebersetzungseinheit bleibt
-// auf der Grundarchitektur (GO liefert generisches x86-64 aus), und ein
-// Laufzeit-Tor entscheidet.
+// ---- AVX2 extrapolation kernel ------------------------------------------
+// Same pattern as GOSoundFader/GOSoundResampleBatch in the host
+// application: the kernel itself carries target("avx2"), the rest of the
+// translation unit stays on the baseline architecture (the host ships
+// generic x86-64), and a runtime check decides which path runs.
 //
-// FMA wird BEWUSST nicht benutzt, und fp-contract steht aus.  Getrennte
-// mul/sub/add machen jedes Element bit-identisch zum Skalarpfad - sonst
-// rechnete dieselbe Bibliothek auf einer AVX2-Maschine anders als auf
-// einer ohne, und Lab und GO waeren nicht mehr vergleichbar.  Genau die
-// Vergleichbarkeit ist der Grund, warum die Bibliothek ueberhaupt
-// gebunden statt nachgebaut wird.
+// FMA is DELIBERATELY not used, and fp-contract is off.  Separate
+// mul/sub/add make every element bit-identical to the scalar path -
+// otherwise the same library would compute different results on an
+// AVX2 machine than on one without, and the lab and the host application
+// would no longer be comparable.  That exact comparability is the whole
+// reason this library is linked rather than reimplemented per host.
 #if (defined(__GNUC__) || defined(__clang__))                                  \
   && (defined(__x86_64__) || defined(__i386__))
 #define XO_AVX2 1
@@ -180,15 +182,15 @@ static inline bool XoProfiling() {
 #endif
 
 static inline bool XoAvx2() {
-  // XO_NO_AVX2=1 erzwingt den Skalarpfad - Notausgang und, wichtiger,
-  // die Gegenprobe auf Bit-Gleichheit auf EINER Maschine.
+  // XO_NO_AVX2=1 forces the scalar path - an escape hatch and, more
+  // importantly, the way to verify bit-identical output on ONE machine.
   static const bool has
     = __builtin_cpu_supports("avx2") && !getenv("XO_NO_AVX2");
 
   return has;
 }
 
-// acc = a * s  (komplex), acht Bins je Durchgang.
+// acc = a * s  (complex), eight bins per pass.
 XO_AVX2_FN static void XoAdvFirst(
   unsigned n, const float *aRe, const float *aIm, const float *sRe,
   const float *sIm, float *accRe, float *accIm) {
@@ -213,7 +215,7 @@ XO_AVX2_FN static void XoAdvFirst(
   }
 }
 
-// acc += a * s  (komplex).
+// acc += a * s  (complex).
 XO_AVX2_FN static void XoAdvAcc(
   unsigned n, const float *aRe, const float *aIm, const float *sRe,
   const float *sIm, float *accRe, float *accIm) {
@@ -243,22 +245,24 @@ XO_AVX2_FN static void XoAdvAcc(
 }
 #endif
 
-// ---- endlich? ---------------------------------------------------------
-// std::isfinite() ist in diesem Uebersetzungsmodul WERTLOS: GrandOrgue
-// baut mit -ffast-math, das -ffinite-math-only einschliesst, und darunter
-// faltet GCC jedes isfinite() zur Konstanten `true` (nachgeprueft am
-// Assembler: `movl $1, %eax; ret`).  Saemtliche NaN-Netze in SolveBin
-// waren damit toter Code - gemessene Folge: nach Stille + Einsatz
-// divergiert Durand-Kerner, die NaN-Wurzeln landen im Warmstart-Speicher
-// des Bins und werden von dort aus EWIG neu gesaet (Reproduktion
-// 2026-08-09: 140288 NaN-Abtastwerte in drei Sekunden eines voellig
-// normalen gehaltenen Tons, lange nach dem ausloesenden Ereignis).
+// ---- finite? --------------------------------------------------------------
+// std::isfinite() is USELESS in this translation unit: the host
+// application builds with -ffast-math, which implies
+// -ffinite-math-only, and under that flag GCC folds every isfinite()
+// call to the constant `true` (confirmed in the generated assembly:
+// `movl $1, %eax; ret`).  Every NaN guard in SolveBin was therefore dead
+// code - the measured consequence: after silence followed by a note
+// onset, Durand-Kerner diverges, the resulting NaN roots land in a
+// bin's warm-start state, and get re-seeded from there forever (one
+// reproduction: 140288 NaN samples over three seconds of completely
+// ordinary held material, long after the triggering event).
 //
-// Der Bitmustertest kennt keine Rechenregel und ueberlebt daher jede
-// Optimierungsstufe und jedes Mathematik-Flag.  Der Uebersetzungsschalter
-// -fno-finite-math-only in src/xorcist/CMakeLists.txt repariert dasselbe
-// noch einmal von aussen; beide Guertel bleiben, weil genau diese Klasse
-// von stiller Wirkungslosigkeit hier schon mehrfach Wochen gekostet hat.
+// The raw bit-pattern test obeys no arithmetic identity, so it survives
+// any optimisation level and any math flag.  The build-time switch
+// -fno-finite-math-only in src/xorcist/CMakeLists.txt fixes the same
+// problem again from the outside; both safeguards stay, because this
+// exact class of silently-defeated check has cost real debugging time
+// here more than once.
 static inline bool XoFinite(double v) {
   uint64_t b;
 
@@ -357,7 +361,7 @@ struct XoCl {
     if (!so)
       so = dlopen("libOpenCL.so", RTLD_NOW | RTLD_LOCAL);
     if (!so)
-      return; // keine OpenCL-Laufzeit - stiller CPU-Betrieb
+      return; // no OpenCL runtime found - silent CPU-only operation
 
 #define XO_SYM(f, n) \
   do { \
@@ -402,7 +406,7 @@ struct XoCl {
     if (err != CL_SUCCESS)
       return;
 
-    // Kernelquelle: Umgebung > neben der .so > Repo-Pfad.
+    // Kernel source lookup order: environment > next to the .so > repo path.
     size_t slen = 0;
     char *src = nullptr;
     const char *envSrc = getenv("XO_KERNEL_SRC");
@@ -448,7 +452,7 @@ struct XoCl {
 
       GetBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, n, log, nullptr);
       log[n] = 0;
-      fprintf(stderr, "xorcist: Kernel-Build fehlgeschlagen:\n%s\n", log);
+      fprintf(stderr, "xorcist: kernel build failed:\n%s\n", log);
       free(log);
       return;
     }
@@ -538,18 +542,18 @@ struct Xorcist {
   // extrapolating from them costs 0.5 dB per period of staleness.
   std::atomic<int> m_Order{1};
   inline static std::atomic<int> s_UseSchur{0};
-  // Ausloeseschwelle der Wurzelkappung; 0 = eingebaute 0.9.  Das ZIEL
-  // ist immer der Einheitskreis - die Schwelle entscheidet nur, WER
-  // geschnappt wird.  Statisch wie s_UseSchur, weil SolveBin statisch
-  // ist; fuer das Lab (eine Instanz pro Lauf) ausreichend.
+  // Trigger threshold of the root clamp; 0 = the built-in 0.9.  The
+  // TARGET is always the unit circle - the threshold only decides WHICH
+  // roots get snapped onto it.  Static like s_UseSchur because SolveBin
+  // is itself static; sufficient for the lab (one instance per run).
   inline static std::atomic<float> s_RootClamp{0.0f};
-  // Detektor-Modus (06.08.2026, Nutzer-Entwurf): > 1 = rho-Schur-Test
-  // auf den ROHEN Gauss-Koeffizienten.  Bestanden (gemessen 96 % der
-  // Bins bei 1.02) -> Koeffizienten unveraendert, KEIN Durand-Kerner,
-  // kein Rebuild - die gefittete Huellkurve jeder Mode bleibt erhalten.
-  // Durchgefallen -> warmer DK in double, dann DECKELN: |z| > rho wird
-  // auf rho begrenzt statt auf 1.0 gehoben.  Wachstum wird aufs Budget
-  // gestutzt, Abklingen bleibt, nichts wird verewigt.
+  // Detector mode: > 1 enables an all-roots-inside-rho test (Schur
+  // descent) on the RAW post-Gauss coefficients.  Pass (measured 96% of
+  // bins at threshold 1.02) -> coefficients used unchanged, NO
+  // Durand-Kerner, no rebuild - each mode's fitted envelope is kept
+  // intact.  Fail -> warm double-precision DK, then CLAMP: any |z| > rho
+  // is capped at rho instead of being lifted to 1.0.  Growth is cut to
+  // budget, decay is preserved, nothing is made to oscillate forever.
   inline static std::atomic<float> s_DetectRho{0.0f};
   static double RootClampThresh() {
     const float t = s_RootClamp.load(std::memory_order_relaxed);
@@ -576,45 +580,49 @@ struct Xorcist {
 #define XO_AR_ORDER_MAX 8
 #endif
   static constexpr unsigned AR_ORDER_MAX = XO_AR_ORDER_MAX;
-  // ---- Normalgleichungen: planares HERMITESCHES DREIECK ---------------
-  // P[k][l] = sum X_k * conj(X_l) ist hermitesch - und zwar EXAKT, nicht
-  // naeherungsweise: die Rekursion startet bei null, und
-  // lam*hermitesch + hermitesches Aussenprodukt bleibt hermitesch.  Der
-  // Realteil ist symmetrisch, der Imaginaerteil vorzeichenverkehrt, beides
-  // bitgenau (Gleitkomma-Multiplikation ist kommutativ).  Gespeichert wird
-  // deshalb nur k <= l: 36 statt 64 Eintraege bei Ordnung 8.
+  // ---- Normal equations: planar HERMITIAN TRIANGLE ---------------------
+  // P[k][l] = sum X_k * conj(X_l) is Hermitian - EXACTLY, not
+  // approximately: the recursion starts at zero, and
+  // lambda*Hermitian + Hermitian outer product stays Hermitian.  The
+  // real part is symmetric, the imaginary part antisymmetric, both bit
+  // exact (floating-point multiplication is commutative).  Only k <= l
+  // is therefore stored: 36 entries instead of 64 at order 8.
   //
-  // PLANAR, getrennte Re-/Im-Ebenen, Bin als schnellster Index.  Die alte
-  // Ablage [bin][k][l] mit verschachtelten Re/Im war in BEIDE Richtungen
-  // unvektorisierbar: ueber l springen die Eingangswerte um NBINS_MAX,
-  // ueber die Bins springt P um 128 Doubles.  Planar laeuft die innere
-  // Schleife zusammenhaengend ueber alle Bins - und dasselbe Layout ist
-  // auf der GPU der Unterschied zwischen koaleszierten und gestreuten
-  // Zugriffen benachbarter Arbeitsobjekte.
+  // PLANAR, separate real/imaginary planes, bin as the fastest-varying
+  // index.  The earlier [bin][k][l] layout with interleaved re/im could
+  // not be vectorised in EITHER direction: stepping over l jumps the
+  // input values by NBINS_MAX, stepping over bins jumps P by 128
+  // doubles.  Planar layout lets the inner loop run contiguously over
+  // all bins - and the same layout is, on a GPU, the difference between
+  // coalesced and scattered memory accesses for neighbouring work
+  // items.
   //
-  // Dreieck und Vektorisierung widersprechen sich NICHT, solange ueber die
-  // Bins vektorisiert wird: das Dreieck kuerzt die AEUSSERE Paarschleife
-  // von 64 auf 36, die innere bleibt in beiden Faellen nbins lang.  (Ueber
-  // l vektorisiert waere es umgekehrt - variable, kurze Zaehllaengen.)
+  // The triangle and vectorisation do NOT conflict, as long as
+  // vectorisation runs over the bins: the triangle only shortens the
+  // OUTER pair loop from 64 to 36; the inner loop stays nbins long
+  // either way.  (Vectorising over l instead would be the opposite -
+  // short, variable-length runs.)
   static constexpr unsigned AR_PAIRS
     = AR_ORDER_MAX * (AR_ORDER_MAX + 1) / 2;
 
-  /** Index des Paares (k, l) im Dreieck, NUR fuer k <= l. */
+  /** Index of pair (k, l) in the triangle, valid ONLY for k <= l. */
   static constexpr unsigned PairOf(unsigned k, unsigned l) {
     return k * AR_ORDER_MAX - k * (k - 1) / 2 + (l - k);
   }
 
-  std::vector<double> m_ArPRe, m_ArPIm; // [ch][paar][bin]
+  std::vector<double> m_ArPRe, m_ArPIm; // [ch][pair][bin]
   std::vector<double> m_ArQRe, m_ArQIm; // [ch][k][bin]
 
-  /** Ein Bin aus dem Dreieck in die DICHTE Form auffalten, wie SolveBin,
-   * der Leiter-Solve und der GPU-Upload sie erwarten: P verschachtelt
-   * [k*AR_ORDER_MAX + l][re,im], Q [k][re,im].  Fuer k > l wird gespiegelt
-   * und der Imaginaerteil negiert - das ist die Hermitezitaet, exakt.
+  /** Unfold one bin from the triangle into the DENSE form SolveBin, the
+   * ladder solve and the GPU upload all expect: P interleaved as
+   * [k*AR_ORDER_MAX + l][re,im], Q as [k][re,im].  For k > l the entry
+   * is mirrored and the imaginary part negated - exactly what Hermitian
+   * symmetry requires.
    *
-   * Kostet 36 gestreute Lesevorgaenge je geloestem Bin, und geloest wird
-   * nur ein Sechzehntel der Bins je Periode; gegen die Ersparnis in der
-   * Akkumulation, die JEDE Periode ALLE Bins anfasst, ist das nichts. */
+   * Costs 36 scattered reads per solved bin, and only a sixteenth of
+   * the bins are solved per period; against the savings in
+   * accumulation, which touches EVERY bin EVERY period, that is
+   * negligible. */
   void GatherBin(
     unsigned ch, unsigned bin, unsigned order, double *dstP,
     double *dstQ) const {
@@ -636,8 +644,8 @@ struct Xorcist {
     }
   }
 
-  /** Alle Eintraege EINES Bins auf null - beim Hybrid-Reset und beim
-   * Ordnungswechsel.  Gestreut, aber selten. */
+  /** Zero every entry of ONE bin - used on a hybrid-mode reset and on an
+   * order change.  Scattered access, but rare. */
   void ClearBin(unsigned ch, unsigned bin) {
     const size_t pb = (size_t)ch * AR_PAIRS * NBINS_MAX + bin;
     const size_t qb = (size_t)ch * AR_ORDER_MAX * NBINS_MAX + bin;
@@ -669,16 +677,16 @@ struct Xorcist {
   // per period cost 2.45x the order-1 prediction; solving per grid point
   // is the same numbers for a fraction of that.
   std::vector<float> m_ArCoefRe, m_ArCoefIm; // [ch][bin][k], k = 0..p-1
-  // PLANARER SPIEGEL der Koeffizienten, [ch][k][bin] statt [ch][bin][k].
-  // Grund: AdvanceBins laeuft ueber die BINS, und der Zustand liegt schon
-  // planar - nur die Koeffizienten lagen verschachtelt, was die Schleife
-  // unvektorisierbar machte (der Uebersetzer haette je Bin sammeln
-  // muessen).  Umkopieren kostet nbins*P Werte je Kanal und Periode, also
-  // rund 6 % dessen, was die Schleife danach vektorisiert erledigt.
-  // Die Ablage oben bleibt, wie sie ist - SolveBin und der Hybrid-Pfad
-  // schreiben und lesen sie weiter per Bin.
+  // PLANAR MIRROR of the coefficients, [ch][k][bin] instead of
+  // [ch][bin][k].  Reason: AdvanceBins loops over BINS, and the rest of
+  // its state is already planar - only the coefficients were
+  // interleaved, which made that loop unvectorisable (the compiler
+  // would have had to gather per bin).  Copying costs nbins*P values
+  // per channel per period, roughly 6% of what the vectorised loop
+  // saves afterwards.  The layout above is left as it is - SolveBin and
+  // the hybrid path keep writing and reading it per bin.
   std::vector<float> m_ArCoefReP, m_ArCoefImP;
-  // Kratzspeicher der Extrapolation, je Kanal ein Bin-Vektor.
+  // Extrapolation scratch space, one bin vector per channel.
   std::vector<float> m_AdvAccRe, m_AdvAccIm;
   // Last solved roots per bin, the WARM START for Durand-Kerner: on
   // quasi-stationary material the roots barely move between solves, so
@@ -722,50 +730,51 @@ struct Xorcist {
   std::atomic<uint64_t> m_LastConcealedPeriod{0};
   std::atomic<int> m_GateFit{0};
   std::atomic<int> m_StaleWindow{0};
-  // Wie oft faellt der AR-Pfad auf den Ordnung-1-Rotator zurueck, weil
-  // eine Stuetzstelle im Spektrenring fehlt?  Der Ring wird NUR beim
-  // Schattenbau beschrieben, und der laeuft waehrend einer Lueckenkette
-  // nicht - also reisst dort ein Loch, das spaetere Gitterpunkte trifft.
+  // How often does the AR path fall back to the order-1 rotator because
+  // a grid point is missing from the spectrum ring?  The ring is only
+  // written when a shadow is built, and that does not happen during a
+  // miss streak - so a hole is torn there that later grid points can
+  // land in.
   std::atomic<int> m_Backfill{0};
   std::atomic<int> m_FitWindow{0};
   std::atomic<int> m_SolveEvery{0};
   std::atomic<int> m_BurgEvery{0};
   std::atomic<int> m_Replica{0};
-  std::atomic<int> m_FadeInRing{1};   // Vorgabe AN - siehe Push()
-  std::atomic<int> m_CapSpan{0};      // 0 = ganzer Schatten
+  std::atomic<int> m_FadeInRing{1};   // default ON - see Push()
+  std::atomic<int> m_CapSpan{0};      // 0 = whole shadow
   std::atomic<int> m_ReentryOverride{0};
-  std::atomic<int> m_AnchorTau{0};   // Samples; 0 = rate/3000
-  // Eigenes Flag, weil Pass() und Push() in verschiedenen Reihenfolgen
-  // gerufen werden: die Engine pusht im Mix-Epilog und blendet erst
-  // spaeter beim Ausliefern, das Lab umgekehrt.  Zwei Flags, jedes von
-  // genau einem Verbraucher geleert, sind gegen beide Reihenfolgen
-  // immun.
+  std::atomic<int> m_AnchorTau{0};   // samples; 0 = rate/3000
+  // Its own flag because Pass() and Push() are called in different
+  // orders by different hosts: the engine pushes in the mix epilogue
+  // and only blends later on delivery, the lab the other way round.
+  // Two flags, each cleared by exactly one consumer, are immune to
+  // either ordering.
   bool m_RingBlendPending = false;
-  // Absorb(): Analyse ohne Synthese - siehe die Sollbruchstelle in
-  // ComputeChannelShadow.  Nur vom (sequenziellen) Lab benutzt; die
-  // Engine setzt es nie.
+  // Absorb(): analysis without synthesis - see the deliberate early-out
+  // in ComputeChannelShadow.  Only used by the (sequential) offline
+  // lab; the real-time engine never sets this.
   bool m_AnalyzeOnly = false;
 
-  // ---- GPU (v1: nur der Solve) ---------------------------------------
+  // ---- GPU (v1: solve stage only) --------------------------------------
   std::atomic<int> m_Gpu{[] {
     const char *e = getenv("XO_GPU");
 
     return e ? atoi(e) : 0;
   }()};
-  // Solve-Film: Mitschrift dessen, was der Kernel je Bin GETAN hat.
-  // Nur Labor - GO setzt das Feld nie, und der Ring wird erst beim
-  // ersten Bild belegt.
+  // Solve trace: a record of what the kernel DID for each bin.  Lab use
+  // only - the host application never sets this field, and the ring
+  // only fills in once the first frame is written.
   std::atomic<int> m_SolveTap{0};
 #ifndef XO_NO_OPENCL
-  bool m_GpuBad = false;      // einmal gescheitert -> CPU bis zum Ende
+  bool m_GpuBad = false;      // failed once -> stay on CPU for good
   unsigned m_GpuOrder = 0, m_GpuNbins = 0;
   std::vector<cl_mem> m_dP, m_dQ, m_dCoef, m_dRoots, m_dTap; // [ch]
   std::vector<double> m_GpuPack;
   std::vector<float> m_GpuCoefDl;
-  // Laufendes Feld von Kanal 0.  Ein Kernelstart deckt nur EINEN
-  // Streifen ab; das Bild entsteht erst, wenn die Streifen den Bereich
-  // einmal gekachelt haben - bis dahin steht in den noch nicht
-  // besuchten Bins -1 ("noch nicht gerechnet"), keine erfundene Null.
+  // In-progress frame for channel 0.  One kernel launch only covers ONE
+  // strip; the frame is only complete once the strips have tiled the
+  // whole range - until then, bins not yet visited hold -1 ("not
+  // computed yet"), never a made-up zero.
   std::vector<float> m_TapDl, m_TapZ, m_TapPath, m_TapRoots;
 
   void GpuRelease() {
@@ -785,9 +794,10 @@ struct Xorcist {
     m_GpuOrder = m_GpuNbins = 0;
   }
 
-  // Loest den Streifen [b0,b1) von Kanal ch auf dem Geraet.  true =
-  // erledigt, false = CPU soll uebernehmen (und m_GpuBad haelt es dann
-  // dauerhaft dort - die CPU-Akkumulatoren sind ja weitergelaufen).
+  // Solves the strip [b0,b1) of channel ch on the device.  true = done,
+  // false = the CPU should take over (and m_GpuBad then keeps it there
+  // permanently - the CPU accumulators kept running regardless, so
+  // there is nothing to resynchronise).
   bool GpuSolveRange(
     unsigned ch, unsigned b0, unsigned b1, unsigned order, unsigned nbins,
     bool resetRoots) {
@@ -824,10 +834,10 @@ struct Xorcist {
           m_dRoots[c] = cl.CreateBuffer(
             cl.ctx, CL_MEM_READ_WRITE,
             (size_t)nbins * order * 2 * sizeof(float), nullptr, &err);
-        // Immer belegt, auch bei ausgeschaltetem Film: 16 KB je Kanal
-        // gegen eine Sonderbehandlung im Neubau-Pfad ist kein Handel.
-        // Der Kernel bekommt bei ausgeschaltetem Film NULL uebergeben
-        // und fasst den Puffer dann nicht an.
+        // Always allocated, even with the trace off: 16 KB per channel
+        // is a cheap price to avoid special-casing the rebuild path.
+        // With the trace off the kernel is simply passed NULL for it
+        // and never touches the buffer.
         if (err == CL_SUCCESS)
           m_dTap[c] = cl.CreateBuffer(
             cl.ctx, CL_MEM_WRITE_ONLY,
@@ -853,13 +863,15 @@ struct Xorcist {
       }
     }
 
-    // Streifen packen: Engine-Layout (Stride AR_ORDER_MAX) -> dicht.
+    // Pack the strip: host-application layout (stride AR_ORDER_MAX) ->
+    // dense.
     const unsigned n = b1 - b0;
-    // Das Geraet bekommt weiter die DICHTE Form - der Kernel bleibt damit
-    // Wort fuer Wort derselbe.  Das planare Dreieck waere fuer die GPU
-    // sogar besser (benachbarte Arbeitsobjekte laesen dann benachbarte
-    // Adressen statt 128 Doubles auseinander), aber das ist ein eigener
-    // Schritt in beiden Texten und nicht dieser hier.
+    // The device still receives the DENSE form - this keeps the kernel
+    // word-for-word identical either way.  The planar triangle would
+    // actually be better for the GPU (neighbouring work items would
+    // then read neighbouring addresses instead of ones 128 doubles
+    // apart), but that is a separate change to both texts, not this
+    // one.
     m_GpuPack.resize((size_t)n * order * order * 2 + (size_t)n * order * 2);
 
     double *tP = m_GpuPack.data();
@@ -907,9 +919,9 @@ struct Xorcist {
         err = cl.SetArg(cl.kSolve, 9, sizeof(float), &detRho);
       }
       if (err == CL_SUCCESS) {
-        // Ein NULL-Pufferobjekt ist die vorgesehene Art, einem
-        // __global-Zeiger nichts zu geben - der Kernel prueft darauf.
-        // Nur Kanal 0 wird gelesen, also soll auch nur er schreiben.
+        // A NULL buffer object is the intended way to pass nothing to a
+        // __global pointer - the kernel checks for it explicitly.  Only
+        // channel 0 is ever read back, so only it should write.
         const cl_mem tapArg = (tap && ch == 0) ? m_dTap[ch] : nullptr;
 
         err = cl.SetArg(cl.kSolve, 10, sizeof(cl_mem), &tapArg);
@@ -933,9 +945,9 @@ struct Xorcist {
       return false;
     }
 
-    // Solve-Film abholen.  Blockierend wie der Koeffizienten-Rueckweg
-    // direkt darueber, also KEIN zusaetzlicher Stillstand der
-    // Warteschlange - aber ein zweiter Transfer, und der kostet Zeit.
+    // Retrieve the solve trace.  Blocking, just like the coefficient
+    // read-back right above it, so this adds NO extra queue stall of
+    // its own - but it is a second transfer, and that costs time.
     if (tap && ch == 0) {
       const size_t stride = TapStride(order);
 
@@ -963,16 +975,16 @@ struct Xorcist {
           &m_TapRoots[(size_t)(b0 + bin) * order * 2], row + 2,
           (size_t)order * 2 * sizeof(float));
       }
-      // Der Streifen, der den Bereich schliesst, gibt das Bild frei.
-      // b1 == nbins trifft genau einmal je Zyklus zu (der letzte
-      // Streifen rundet auf nbins auf) und immer beim Vollsolve.
+      // The strip that closes the range publishes the frame.  b1 ==
+      // nbins is true exactly once per cycle (the last strip rounds up
+      // to nbins) and always on a full solve.
       if (b1 == nbins)
         TapPush(
           m_TapZ.data(), m_TapPath.data(), m_TapRoots.data(), nbins, order,
           RoundPeriod() * m_SamplesPerBuffer);
     }
 
-    // dicht -> Engine-Layout der Koeffizienten
+    // dense -> host-application coefficient layout
     float *cRe = m_ArCoefRe.data() + (size_t)ch * NBINS_MAX * AR_ORDER_MAX;
     float *cIm = m_ArCoefIm.data() + (size_t)ch * NBINS_MAX * AR_ORDER_MAX;
 
@@ -986,10 +998,10 @@ struct Xorcist {
     return true;
   }
 #endif // XO_NO_OPENCL
-  // Wirksame Fade-Laenge, zur Laufzeit verkuerzbar.  m_ReentryFade
-  // dimensioniert die Puffer und bleibt konstant; hiermit laesst sich
-  // eine KUERZERE Rampe waehlen, ohne neu zu allozieren.  Der Nutzer
-  // will eine Messreihe bis hinab zu 0,2 ms fahren.
+  // Effective fade length, shortenable at runtime.  m_ReentryFade sizes
+  // the buffers and stays constant; this lets a SHORTER ramp be
+  // selected without reallocating - useful for sweeping a measurement
+  // series down to as little as 0.2 ms.
   std::atomic<unsigned> m_ReentryUse{0};   // 0 = m_ReentryFade
 
   unsigned ReentryLen() const {
@@ -1005,55 +1017,57 @@ struct Xorcist {
     return 0.5f + 0.5f * cosf((float)M_PI * (float)i / (float)n);
   }
   inline static std::atomic<uint64_t> s_Backfills{0};
-  // rho-Schur-DETEKTOR, nur Zaehlung (XO_COUNT_RHO=<rho>): wie viele
-  // Bins wuerden den Wachstumsbudget-Test verfehlen?  Die eine Zahl,
-  // an der haengt, ob der Lazy-DK-Umbau lohnt.
+  // rho-Schur DETECTOR, counting only (XO_COUNT_RHO=<rho>): how many
+  // bins would fail the growth-budget test?  The one number that
+  // decides whether the lazy-Durand-Kerner rework is worthwhile.
   inline static std::atomic<uint64_t> s_PatchCount{0};
-  // Kleiner Ereignisring, damit das Lab ZEIGEN kann, wo gepatcht wurde -
-  // ohne Anzeige ist ein Feature nicht beurteilbar.
+  // Small event ring so the offline lab can SHOW where a patch was
+  // applied - a feature cannot be judged without being able to see it.
   static constexpr unsigned PATCH_LOG = 512;
   inline static std::atomic<uint64_t> s_PatchLogN{0};
   inline static uint64_t s_PatchLog[PATCH_LOG][3] = {{0}};
-  // Hybrid-Episoden fuers Spektrogramm: (startSample, endSample,
-  // band | ordnung<<16 | nfft<<32) - eine Episode = ein Band, das die
-  // kurze Kette gespielt hat, Kanal 0.  Ring wie das Patch-Log.
-  // 16384: mit 'alle Baender' erzeugt JEDES Ereignis 256 Episoden -
-  // bei 4096 fielen die aeltesten aus dem Ring, und die ersten vier
-  // Einsaetze der D-Dur-Datei hatten keine Marks (Nutzer, 08.08.).
+  // Hybrid episodes for the spectrogram display: (startSample,
+  // endSample, band | order<<16 | nfft<<32) - one episode = one band
+  // that the short chain played, channel 0 only.  Ring buffer like the
+  // patch log above.  16384: with "all bands" active, every onset
+  // produces 256 episodes at once - a 4096-entry ring let the oldest
+  // ones drop out, losing the marks for the first few onsets of a test
+  // run entirely. */
   static constexpr unsigned HYB_LOG = 16384;
   inline static std::atomic<uint64_t> s_HybLogN{0};
   inline static uint64_t s_HybLog[HYB_LOG][3] = {{0}};
 
-  // ---- Solve-Film ------------------------------------------------------
-  // Ein Bild je vollstaendigem Bin-Durchlauf von Kanal 0.  Anders als die
-  // Ereignisringe darueber ist ein Bild kein Tripel, sondern nbins Werte;
-  // deshalb HEAP und erst bei Bedarf belegt (bei 4k und 512 Bildern sind
-  // es 16 MB, die kein Wirt bezahlen soll, der nie zuschaut).  Der Mutex
-  // ist billig, weil er nur bei eingeschaltetem Film ueberhaupt angefasst
-  // wird - und ein halb ueberschriebenes Bild waere als Bild wertlos.
-  // Eine Bin-Zeile des Geraets: [max|z|, Zweig, Re z0, Im z0, ...].
+  // ---- Solve trace --------------------------------------------------------
+  // One frame per complete pass over channel 0's bins.  Unlike the
+  // event rings above, a frame is not a triple but nbins values each;
+  // so it lives on the HEAP and is only allocated on demand (at 4k and
+  // 512 frames that would be 16 MB, which no host that never looks at
+  // it should have to pay for).  The mutex is cheap because it is only
+  // ever touched while the trace is enabled - and a half-overwritten
+  // frame would be worthless as a frame anyway.
+  // One bin row from the device: [max|z|, branch, re z0, im z0, ...].
   static constexpr unsigned TapStride(unsigned order) {
     return 2 + 2 * order;
   }
-  // Nicht die BILDZAHL wird gedeckelt, sondern der Speicher: eine Zeile
-  // waechst mit der Ordnung (bei 4k/O20 ist ein Bild 21x so gross wie
-  // bei O1), und ein fester Ringlaenge hiesse, dass ausgerechnet die
-  // teuren Laeufe am meisten belegen.
+  // What is capped here is MEMORY, not the frame count: a row grows
+  // with the order (at 4k/order 20 a frame is 21x the size it is at
+  // order 1), so a fixed ring length would mean the most expensive runs
+  // get to keep the most history.
   static constexpr size_t TAP_BUDGET = 48u << 20;   // 48 MB
   static constexpr unsigned TAP_FRAMES_MIN = 16, TAP_FRAMES_MAX = 512;
   inline static std::mutex s_TapMx;
   inline static std::vector<float> s_TapZ, s_TapPath, s_TapRoots;
   inline static std::vector<uint64_t> s_TapPos;
   inline static unsigned s_TapNbins = 0, s_TapOrder = 0, s_TapFrames = 0;
-  inline static uint64_t s_TapN = 0;   // insgesamt geschriebene Bilder
+  inline static uint64_t s_TapN = 0;   // frames written in total
 
   static void TapPush(
     const float *z, const float *path, const float *roots, unsigned nbins,
     unsigned order, uint64_t pos) {
     std::lock_guard<std::mutex> g(s_TapMx);
 
-    // Moduswechsel: Bilder zweier Geometrien liessen sich nicht in einer
-    // Anzeige zeigen, also faengt der Ring neu an.
+    // Geometry change: frames from two different geometries could not
+    // be shown together in one display, so the ring starts over.
     if (s_TapNbins != nbins || s_TapOrder != order || s_TapZ.empty()) {
       const size_t perFrame
         = (size_t)nbins * (2 + (size_t)order * 2) * sizeof(float);
@@ -1086,43 +1100,45 @@ struct Xorcist {
 
   inline static std::atomic<uint64_t> s_RhoFails{0};
   inline static std::atomic<uint64_t> s_RhoTests{0};
-  // Lief das Geraet wirklich?  Ein gesetztes Haekchen beweist nichts:
-  // Rechteckfenster (replica) und Schur bleiben CPU, ein gescheitertes
-  // Geraet faellt dauerhaft zurueck - und bis zum 07.08. sperrte auch
-  // der Detektor-Modus die GPU stillschweigend aus.  Wer die
-  // Einstellung anzeigt, soll die WIRKUNG anzeigen koennen.
-  // Wirkt der Hybrid-Haken ueberhaupt?  Er faellt still aus, wenn der
-  // Basisrahmen 1k IST oder die Puffergroesse 256 nicht teilt (das Lab
-  // koppelt den Puffer an die Luecken-Breite!).  Nach dem GPU-Vorfall
-  // vom 07.08. gilt: Wirkung anzeigen, nicht Zustand.
+  // Did the device actually run?  A nonzero count proves nothing on its
+  // own: the replica (rectangular-window) path and Schur mode always
+  // stay on the CPU, and a device that fails once falls back
+  // permanently.  A host that exposes the setting should be able to
+  // show its actual EFFECT, not just whether the flag is set.
+  // Is the hybrid flag having any effect at all?  It silently does
+  // nothing if the base frame IS 1k already, or if the period size does
+  // not divide 256 (the lab ties its buffer size to the gap width!).
+  // The rule since discovering the earlier GPU silent-disable bug: show
+  // the effect, not just the state of the setting.
   inline static std::atomic<uint64_t> s_HybOnPeriods{0};
   inline static std::atomic<uint64_t> s_HybOffPeriods{0};
   inline static std::atomic<uint64_t> s_HybBandPeriods{0};
-  // ZUENDUNGEN des Transientendetektors, je Kanal und Ereignis.  Auf
-  // gehaltenem Klang gehoert hier eine Null hin; gemessen 10.08.2026
-  // steht dort bei 6000 Luecken/min eine 25 - der Detektor zuendet auf
-  // den eigenen Wiedereinstiegen.  Deshalb sichtbar statt vermutet.
+  // Transient-detector TRIGGERS, per channel and per event.  On held
+  // material this should read zero; measured at 6000 misses/min it
+  // instead read 25 - the detector was triggering on its own
+  // re-entries.  Made visible here rather than left as a suspicion.
   inline static std::atomic<uint64_t> s_HybOnsets{0};
-  // JE KANAL, damit ein Wirt sagen kann WELCHER Kanal zuendet und wie
-  // dicht dessen Spektrum ueberhaupt besetzt ist.  Der summierende
-  // Gesamtzaehler verbirgt genau das - und ein Stereo-Downmix, wie ihn
-  // ein Rekorder schreibt, kann es prinzipiell nicht zeigen: Summieren
-  // fuellt Baender, die im Einzelkanal leer sind.
+  // PER CHANNEL, so a host can say WHICH channel is triggering and how
+  // densely that channel's spectrum is actually occupied.  A single
+  // summed counter hides exactly that - and a stereo downmix, as a
+  // recorder would produce, can never show it in principle: summing
+  // fills in bands that are empty in the individual channels.
   static constexpr unsigned DET_CH_MAX = 16;
   inline static std::atomic<uint64_t> s_OnsetPerCh[DET_CH_MAX]{};
   inline static std::atomic<unsigned> s_OccPerCh[DET_CH_MAX]{};
   inline static std::atomic<uint64_t> s_HybOnsetsTent{0};
-  // Zeitstempel der letzten Zuendungen (Abtastwert-Zaehler), damit ein
-  // Wirt sie in seinen Verlauf ZEICHNEN kann statt nur zu zaehlen.
+  // Timestamps of the most recent triggers (sample counter), so a host
+  // can PLOT them against its own timeline instead of only counting
+  // them.
   static constexpr unsigned ONSET_LOG = 256;
   inline static std::atomic<uint64_t> s_OnsetLog[ONSET_LOG]{};
   inline static std::atomic<uint32_t> s_OnsetSeq{0};
   inline static std::atomic<uint64_t> s_GpuRanges{0};
   inline static std::atomic<uint64_t> s_CpuRanges{0};
 
-  // true = alle Wurzeln strikt innerhalb von rho (Schur-Abstieg als
-  // reiner TEST: fruehester Abbruch bei der ersten Verletzung, kein
-  // Kappen, kein Wiederaufstieg).  O(p^2), endlich, eliminationsartig.
+  // true = all roots strictly inside rho (Schur descent used as a pure
+  // TEST: bails out on the first violation, no clamping, no ascent
+  // back).  O(p^2), finite, elimination-like.
   static bool RhoTest(
     const double *ar, const double *ai, unsigned order, double rho) {
     double ur[AR_ORDER_MAX + 1], ui[AR_ORDER_MAX + 1];
@@ -1141,7 +1157,7 @@ struct Xorcist {
       const double km = kr * kr + ki * ki;
 
       if (km >= 1.0)
-        return false; // Box-Bedingung verletzt: Wurzel ausserhalb rho
+        return false; // box condition violated: a root sits outside rho
       const double den = 1.0 - km;
 
       for (unsigned i = 1; i < l; i++) {
@@ -1161,28 +1177,29 @@ struct Xorcist {
   inline static std::atomic<uint64_t> s_GateTests{0};
   inline static std::atomic<uint64_t> s_CapHits{0};
   inline static std::atomic<uint64_t> s_CapCalls{0};
-  // Rennen-Messung (2026-08-09).  Beide Zaehler sind fuer den Wirt
-  // gedacht, der die Vorhersage NEBENLAEUFIG rechnet - das Labor ist
-  // einthreadig und muss hier zwingend 0/0 liefern.
-  //   s_StaleDiscards: PredictEnd hat eine fertige Runde WEGGEWORFEN,
-  //     weil der Ring waehrenddessen weitergeschrieben wurde.  Genau
-  //     das ist "der Rueckruf pfuscht in die Schattenberechnung".
-  //   s_LateSlices: Conceal hat eine Scheibe > 0 gespielt, OHNE dass die
-  //     Vorperiode selbst verdeckt war - also nicht die legitime
-  //     Fehlschlagkette, sondern ein Anker, der zurueckgeblieben ist.
-  //     Das ist die Groesse, die wirklich weh tut (Nahtreparatur sitzt
-  //     nur auf pShadow[0]).
+  // Race-condition diagnostics for hosts that compute the prediction
+  // CONCURRENTLY with their own worker threads - the offline lab is
+  // single-threaded and must always read 0/0 here.
+  //   s_StaleDiscards: PredictEnd DISCARDED a finished round because the
+  //     history ring kept being appended to while it was in flight -
+  //     exactly "the callback is interfering with the shadow
+  //     computation".
+  //   s_LateSlices: Conceal played a slice index > 0 WITHOUT the
+  //     previous period itself having been concealed - i.e. not the
+  //     normal miss-streak chain, but an anchor that has fallen behind.
+  //     This is the number that actually matters (seam repair only ever
+  //     applies to pShadow[0]).
   inline static std::atomic<uint64_t> s_StaleDiscards{0};
   inline static std::atomic<uint64_t> s_LateSlices{0};
-  // Ursachen-Zuordnung der spaeten Scheiben (11.08.2026, reine Messung):
-  // die Hypothese ist, dass der Anker zurueckblieb, WEIL kurz zuvor eine
-  // Oeffnung am Besetzt-Waechter scheiterte (m_ComputeBusy in Predict).
-  // s_LateAfterSkip zaehlt spaete Scheiben, deren letzter Besetzt-Fall
-  // hoechstens zwei Perioden zurueckliegt.  Laufen s_LateSlices und
-  // s_LateAfterSkip im Gleichschritt, ist die Kette bewiesen; klafft es,
-  // gibt es (auch) eine andere Ursache.  s_LateSliceMax haelt die
-  // groesste gespielte Scheibennummer fest - Scheibe 1 heisst "eine
-  // Runde verpasst", mehr heisst Serienausfall der Oeffnungen.
+  // Root-cause breakdown of the late slices above (measurement only):
+  // the hypothesis is that the anchor fell behind BECAUSE an open call
+  // had just failed its busy guard (m_ComputeBusy in Predict).
+  // s_LateAfterSkip counts late slices whose most recent busy failure
+  // was at most two periods earlier.  If s_LateSlices and
+  // s_LateAfterSkip track each other closely, that chain is confirmed;
+  // if they diverge, there is (also) some other cause.  s_LateSliceMax
+  // records the largest slice index actually played - slice 1 means
+  // "one round was missed", higher means repeated open-call failures.
   static constexpr uint64_t NO_SKIP_YET = ~0ull;
   std::atomic<uint64_t> m_LastSkipPeriod{NO_SKIP_YET};
   inline static std::atomic<uint64_t> s_LateAfterSkip{0};
@@ -1224,8 +1241,8 @@ struct Xorcist {
     fftwf_plan fwd, inv;
   };
   PvKit m_Pv[4];
-  // Modus -> Kit-Index.  1k haengt hinten an, damit die gespeicherten
-  // GO-Werte 1/2/3 unveraendert bleiben.
+  // Mode -> kit index.  1k is appended at the end so that the saved
+  // host-application values 1/2/3 stay unchanged.
   static bool ValidMode(int mode) {
     return (mode >= XORCIST_PV_2K && mode <= XORCIST_PV_8K)
       || mode == XORCIST_PV_1K;
@@ -1290,67 +1307,68 @@ struct Xorcist {
   // that much L2 every 2.7 ms, which a bandwidth-bound 24k-voice render
   // feels.)
   std::vector<float> m_History;
-  // Atomar, weil Push() von ZWEI Threads kommt: dem Mix-Epilog (Schnappschuss)
-  // und dem Audio-Rueckruf (Selbstfuetterung in Conceal).  Relaxed reicht -
-  // die Datenabhaengigkeit klaert der eingefrorene Kopf unten, nicht diese
-  // Zelle.
+  // Atomic because Push() is called from TWO threads: the mix epilogue
+  // (a snapshot) and the audio callback (self-feed inside Conceal).
+  // Relaxed ordering is enough - the actual data dependency is resolved
+  // by the frozen head below, not by this cell.
   std::atomic<unsigned> m_HistWrite; // next write position within [0, HIST)
   std::atomic<unsigned> m_HistFill;
 
-  // ---- eingefrorener Schreibkopf fuer die Dauer einer Runde --------------
-  // HistWindow liest RELATIV ZUM SCHREIBKOPF.  Solange der live gelesen
-  // wurde, verschob ein Push mitten in der Runde das Fenster unter den
-  // spaeteren Kanaelen weg - eine verdorbene Analyse mit gueltigem
-  // Ankeretikett.  PredictEnd hat solche Runden deshalb WEGGEWORFEN, was
-  // den Anker zurueckfallen liess und die naechste Verdeckung auf eine
-  // Scheibe > 0 schickte, wo keine Nahtreparatur sitzt (im GO gemessen,
-  // 10.08.2026).
+  // ---- write head frozen for the duration of one round --------------------
+  // HistWindow reads RELATIVE TO THE WRITE HEAD.  As long as that was
+  // read live, a Push() in the middle of a round could shift the window
+  // out from under later channels - a corrupted analysis carrying a
+  // valid-looking anchor tag.  PredictEnd used to DISCARD such rounds,
+  // which let the anchor fall behind and sent the next concealment to a
+  // slice index > 0, where no seam repair applies (measured directly in
+  // the host application).
   //
-  // Jetzt merkt sich die Runde ihren Kopf und liest bis zum Ende daraus.
-  // Das ist gefahrlos, weil der Ring GESPIEGELT ist: ein gleichzeitiger
-  // Push schreibt bei head..head+buf und head+HIST..head+HIST+buf, das
-  // eingefrorene Fenster endet bei head+HIST-1 - die beiden beruehren sich
-  // nicht einmal.  Bis der Schreiber das Fensterende wirklich einholt,
-  // muesste er HIST-len Abtastwerte weit laufen (>= 128 Perioden); eine
-  // Runde dauert weniger als eine.
+  // Now a round remembers its own head and reads from that until it
+  // finishes.  This is safe because the ring is MIRRORED: a concurrent
+  // Push writes at head..head+buf and head+HIST..head+HIST+buf, while
+  // the frozen window ends at head+HIST-1 - the two never even touch.
+  // For the writer to actually catch up to the end of the window it
+  // would have to advance HIST-len samples (>= 128 periods); a round
+  // takes far less than one.
   //
-  // Eingefroren wird BEIDES: der Schreibkopf UND die Periodennummer.  Der
-  // Kopf allein reicht nicht - jeder Zustandsring in diesem Modul wird mit
-  // nowP etikettiert (AR-Streifen nowP % cycle, Spektren-Ring, Hybrid-
-  // Episoden, das 9er-Fach des 4k-Detektors).  Laesse man nowP live, saehe
-  // Kanal 0 die Periode P und Kanal 1 nach einem zwischenzeitlichen Push
-  // P+1: zwei Kanaele, die dasselbe Fenster lesen, es aber verschieden
-  // beschriften.  Genau das hat die alte Verwerfung mitverdeckt, und ohne
-  // sie kostet es 47 dB (gemessen 10.08.2026, erster Anlauf dieses Fixes).
+  // BOTH are frozen: the write head AND the period number.  The head
+  // alone is not enough - every state ring in this module is tagged
+  // with nowP (the AR strip's nowP % cycle, the spectrum ring, hybrid
+  // episodes, the 4k detector's nine-way split).  Reading nowP live
+  // would let channel 0 see period P while channel 1, after an
+  // intervening push, sees P+1: two channels reading the same window
+  // but labelling it differently.  That was exactly what the old
+  // discard behaviour was masking, and without it the cost is 47 dB
+  // (measured on the first attempt at this fix).
   unsigned m_RoundHead = 0;
   uint32_t m_RoundMask = 0;
   std::atomic<bool> m_RoundFrozen{false};
 
-  /** Verdeckungsmaske, wie sie zur Runde gehoert.
+  /** Concealment mask as it belongs to this round.
    *
-   * Push() SCHIEBT diese Maske, und Push() kommt von zwei Threads: aus dem
-   * Mix-Epilog und aus Conceal auf dem Audio-Thread.  Live gelesen konnte
-   * ein Spleiss, den das Veto sperren muss, waehrend der Runde aus dessen
-   * Drei-Bit-Fenster herauswandern - die Zuendung wurde dann durchgelassen,
-   * obwohl sie unmittelbar hinter einem Wiedereinstieg sass.  Dasselbe
-   * Muster wie beim Schreibkopf und beim Periodenetikett, nur an der
-   * Stelle, die ueber Zuenden oder Nichtzuenden entscheidet.  Im
-   * einthreadigen Labor gibt es das nicht. */
+   * Push() SHIFTS this mask, and Push() is called from two threads: the
+   * mix epilogue and Conceal on the audio thread.  Read live, a splice
+   * that the veto needs to block could drift out of its three-bit
+   * window during the round - letting a trigger through even though it
+   * sat immediately behind a re-entry.  Same pattern as the write head
+   * and the period tag above, just at the specific point that decides
+   * whether a trigger fires or not.  Does not occur in the
+   * single-threaded offline lab. */
   uint32_t RoundMask() const {
     return m_RoundFrozen.load(std::memory_order_acquire)
       ? m_RoundMask
       : m_RecentPredMask.load(std::memory_order_relaxed);
   }
 
-  /** Periodennummer, unter der die laufende Runde alles etikettiert. */
+  /** Period number the current round labels everything with. */
   uint64_t RoundPeriod() const {
     return m_RoundFrozen.load(std::memory_order_acquire)
       ? m_PendingPeriod
       : m_HistPeriod.load(std::memory_order_relaxed);
   }
 
-  // Nach dem Stagen eines Analysefensters (Ende bei winEndAbs, Laenge
-  // len, bereits gefenstert in dst) die Patch-Ueberlappung einblenden.
+  // After staging an analysis window (ending at winEndAbs, length len,
+  // already windowed into dst), blend in the patch overlap.
   void OverlayPatch(
     unsigned ch, uint64_t winEndAbs, unsigned len, const float *win,
     float *dst) const {
@@ -1422,8 +1440,8 @@ struct Xorcist {
   // seed samples, which is what actually guarantees continuity at the
   // gap entry.
   static constexpr uint64_t BURG_REFIT_PERIODS = 8;
-  // Laengstes Rechteck-Fitfenster, das der Spektrenring tragen muss -
-  // der Prototyp benutzt nfit = 20 Tupel.
+  // Longest rectangular fit window the spectrum ring needs to be able
+  // to carry - the offline prototype uses nfit = 20 tuples.
   static constexpr unsigned FIT_WINDOW_MAX = 24;
   std::vector<double> m_BurgA; // [ch][BURG_ORDER]
   std::vector<uint64_t> m_BurgFitPeriod;
@@ -1434,122 +1452,130 @@ struct Xorcist {
   // Delivery-side state, only ever touched by this device's callback thread
   std::vector<float> m_PendingTail; // shadow tail for the re-entry fade
   std::vector<float> m_FadeReentry; // cos 1->0, m_ReentryFade frames
-  std::vector<float> m_ReentryMix;  // Scratch fuer den Ring-Fade
+  std::vector<float> m_ReentryMix;  // scratch space for the ring fade
 
-  // ---- Transienten-Patch (07.08.2026, Nutzer-Entwurf) ------------------
-  // Ein statisches Overlay ueber der Analyse-Historie: im Bereich
-  // [m_PatchStart, m_PatchEnd) liest jede Fensterung aus m_PatchBuf
-  // statt aus dem Ring.  Der Ring selbst bleibt Wahrheit (Straggler,
-  // Backfill-Basis, Wiedereinstieg unberuehrt).  Inhalt: die
-  // RUECKWAERTS rotierte Fortsetzung des stabilisierten Zustands -
-  // phasenexakt an der rechten Kante, weil sie dem realen Zustand
-  // entspringt; links Amplitudenmorph in den Alt-Ton.  Statisch heisst:
-  // einmal geschrieben, nie nachgefuehrt - mit fortschreitender Zeit
-  // enthaelt jedes Fenster von selbst immer mehr Wahrheit (der
-  // staleWindow-Fehlmodus ist konstruktiv ausgeschlossen).
+  // ---- Transient patch -----------------------------------------------
+  // A static overlay on top of the analysis history: within the range
+  // [m_PatchStart, m_PatchEnd), every windowing reads from m_PatchBuf
+  // instead of from the history ring.  The ring itself remains the
+  // source of truth (stragglers, the backfill baseline and re-entry are
+  // all unaffected).  Content: the BACKWARD-rotated continuation of the
+  // stabilised state - phase-exact at its right edge, because it is
+  // derived from the real, settled state; amplitude-morphed into the
+  // old tone towards the left edge.  "Static" means: written once,
+  // never updated afterwards - as real time passes, every analysis
+  // window naturally contains more and more genuine signal on its own
+  // (which rules out the staleWindow failure mode by construction).
   static constexpr unsigned PATCH_MAX = 2048;
   std::vector<float> m_PatchBuf;             // [ch][PATCH_MAX]
-  std::vector<uint64_t> m_PatchStart, m_PatchEnd; // abs. Samples; ==: leer
-  std::atomic<int> m_PatchMode{0};           // 1 = sim-Trigger scharf
-  std::vector<uint64_t> m_OnsetPeriod;       // [ch]; ~0 = kein Kandidat
-  std::vector<unsigned> m_StableCount;       // [ch] Perioden ueber Schwelle
-  std::vector<uint64_t> m_LastPatchSample;   // [ch] Entprellung
-  std::vector<unsigned> m_QuietRun;          // [ch] ruhige Perioden am Stueck
+  std::vector<uint64_t> m_PatchStart, m_PatchEnd; // abs. samples; ==: empty
+  std::atomic<int> m_PatchMode{0};           // 1 = simulated trigger armed
+  std::vector<uint64_t> m_OnsetPeriod;       // [ch]; ~0 = no candidate
+  std::vector<unsigned> m_StableCount;       // [ch] periods above threshold
+  std::vector<uint64_t> m_LastPatchSample;   // [ch] debounce
+  std::vector<unsigned> m_QuietRun;          // [ch] consecutive quiet periods
 
-  // ======== HYBRID: kurze 1k-Zweitkette (Nutzer-Entwurf 07.08.) ========
-  // Grundsatz: nach einem Anschlag darf das Gedaechtnis des Modells nie
-  // weiter zurueckreichen als der Anschlag selbst.  Die kurze Kette
-  // (1k-Rahmen, Raster = eine Periode) laeuft dauerhaft warm mit (eine
-  // FFT pro Periode); beim Einsatz bekommen die betroffenen Baender in
-  // BEIDEN Ketten frische Normalgleichungen.  Das wirksame Gedaechtnis
-  // ist damit min(Alter, Zeitkonstante) und waechst STETIG; die Ordnung
-  // klettert mit den Tupeln (p nutzbar ab p+2 Rasterpunkten, Deckel
-  // hybShortCap).  Uebergabe an die lange Kette, sobald deren frischer
-  // Fit hybHandOrder traegt - bei 2k exakt der Moment, ab dem kein
-  // Rahmen mehr Signal von vor dem Anschlag enthaelt (42,7 ms).  Beide
-  // Ketten synthetisieren per Ueberlappungsaddition, der Schatten ist
-  // die Summe; die Bandgewichte ergaenzen sich punktweise zu eins (hart
-  // an der 94-Hz-Bandgrenze, weich in der Zeit, ~3 Perioden Rampe).
+  // ======== HYBRID: short 1k secondary chain ============================
+  // Principle: after a note onset, the model's memory must never reach
+  // back further than the onset itself.  The short chain (1k frame,
+  // grid = one period) runs continuously, kept warm (one FFT per
+  // period); when an onset fires, the affected bands get fresh normal
+  // equations in BOTH chains.  Effective memory is therefore
+  // min(age, time constant) and grows STEADILY; the order climbs with
+  // the number of real tuples available (order p usable from p+2 grid
+  // points, capped by hybShortCap).  Control hands back to the long
+  // chain once its fresh fit reaches hybHandOrder - at PV 2k that is
+  // exactly the moment no frame still contains pre-onset signal
+  // (42.7 ms).  Both chains synthesise via overlap-add; the shadow is
+  // their sum, and the per-band weights add up to one pointwise (a hard
+  // edge at the 94 Hz band boundary, smoothed in time over roughly
+  // 3 periods).
   //
-  // EHRLICHE LUECKEN v1: (1) die ersten Tupel nach dem Reset enthalten
-  // Lags von VOR dem Anschlag (der Spektrenring wird nicht geleert) -
-  // die Leiter begrenzt nur die GENUTZTE Ordnung; (2) Bandkanten hart;
-  // (3) kein Pegeltrend auf der kurzen Kette; (4) kein Backfill fuer
-  // ihren Ring (Stempel-Luecken lassen Tupel aus statt zu reparieren).
+  // HONEST LIMITATIONS of this v1: (1) the first tuples after a reset
+  // still contain lags from BEFORE the onset (the spectrum ring itself
+  // is not cleared) - the order ladder only limits the order actually
+  // USED; (2) band edges are hard, not smoothed; (3) no level trend is
+  // applied on the short chain; (4) no backfill for its ring (a gap in
+  // the timestamps simply skips a tuple instead of repairing it).
   static constexpr unsigned HYB_NFFT = 1024;
   static constexpr unsigned HYB_NBINS = HYB_NFFT / 2 + 1;
   static constexpr unsigned HYB_RING = 16;
   static constexpr uint16_t HYB_DORMANT = 0xFFFF;
   std::atomic<int> m_Hybrid{0};
-  // 1 = Akkumulator-Reset beim Anschlag (der urspruengliche Entwurf).
-  // GEMESSEN SCHAEDLICH als Vorgabe: das Nullen wirft der langen Kette
-  // pro Einsatz in ~100 Baendern 200 ms Fit weg - Schaden weit ueber
-  // das Transientenfenster hinaus (+6.5 dB NMR ohne B-Beteiligung,
-  // XO_HYB_NO_B).  Die KONTINUIERLICHE kurze Kette klingt am Einsatz
-  // dagegen ungestoert (Hoerbefund des Nutzers, 1k/2 und 1k/5) - ihr
-  // 80-ms-Gedaechtnis waescht den Alt-Klang schnell genug aus.  Bleibt
-  // als Knopf fuer Messungen.
+  // 1 = reset the accumulator on note onset (the original design).
+  // MEASURED HARMFUL as a default: zeroing throws away ~200 ms of fit
+  // in roughly 100 bands of the long chain per onset - damage that
+  // reaches far beyond the transient window itself (+6.5 dB NMR
+  // without chain-B participation, i.e. XO_HYB_NO_B).  By contrast, the
+  // CONTINUOUSLY running short chain sounds undisturbed right at the
+  // onset (confirmed by listening) - its roughly 80 ms memory washes
+  // out the old tone quickly enough on its own.  Kept as a knob for
+  // measurement.
   std::atomic<int> m_HybReset{0};
   std::atomic<int> m_HybAllBands{0};
   std::atomic<int> m_HybShortCap{6};
-  // 0 = VOLLBETRIEB als Vorgabe.  Wichtig zum Verstaendnis: im
-  // Normalmodus gibt es KEINE Ordnungsleiter - die kurze Kette spielt
-  // ab dem Wechsel sofort cap aus ihrem WARMEN Akkumulator.  Der
-  // Sparbetrieb fuehrt eine Leiter ein (warm bis der frische Satz
-  // traegt), und die verliert monoton mit sinkender Warm-Ordnung
-  // (6000/min, Mittel/max/Einsatz): voll -2.70/7.10/+4.75, @5
-  // -2.02/6.97/+4.29, @4 -1.94/6.93/+5.21, @3 -1.53/7.77/+5.30, @2
-  // -1.36/9.88/+7.70.  Grund - zum sechsten Mal diese Woche:
-  // VERUNREINIGTE DATEN SCHLAGEN FEHLENDE.  Ein frischer Akkumulator
-  // traegt 20 ms nach dem Anschlag nur Ordnung 2-3; der warme ist halb
-  // kontaminiert, aber voll bestimmt fuer Ordnung 6.  Der Knopf bleibt
-  // fuer Rechenzeit-Not (voll 326 us, @4 283, @2 240 us pro Periode
-  // bei 2 Kanaelen).
+  // 0 = FULL operation by default.  Important to understand: in normal
+  // mode there is NO order ladder at all - the short chain plays at the
+  // cap order immediately after switching, straight out of its WARM
+  // accumulator.  The power-saving mode instead introduces a ladder
+  // (idling at a lower order until a fresh accumulator catches up), and
+  // quality degrades monotonically as the warm order is lowered
+  // (measured at 6000 misses/min, mean/worst/at-onset): full
+  // -2.70/7.10/+4.75, @5 -2.02/6.97/+4.29, @4 -1.94/6.93/+5.21, @3
+  // -1.53/7.77/+5.30, @2 -1.36/9.88/+7.70.  Reason, confirmed yet
+  // again: CONTAMINATED DATA BEATS MISSING DATA.  A fresh accumulator
+  // can only support order 2-3 some 20 ms after the onset; the warm one
+  // is half-contaminated but fully determined for order 6.  The knob
+  // stays available for when compute time is genuinely tight (full
+  // costs 326 us, @4 283 us, @2 240 us per period at 2 channels).
   std::atomic<int> m_HybWarmOrder{0};
   std::atomic<int> m_HybHandOrder{6};
   std::vector<float> m_HybRingRe, m_HybRingIm; // [ch][slot][HYB_NBINS]
   std::vector<uint64_t> m_HybRingPeriod;       // [ch][slot], ~0 = leer
-  std::vector<double> m_HybP, m_HybQ;          // [ch][bin][k][l] bzw. [k]
-  // SPARBETRIEB (Nutzer-Frage 08.08.: 'muss die 1k-Kette mit Ordnung 6
-  // warmlaufen?'): nein.  Warm laeuft nur die STARTordnung
-  // (hybWarmOrder, 2x2 statt 6x6 = 1/7 der Update-Kosten); ab der
-  // Schaltung akkumuliert ein ZWEITER, frischer Satz bei voller
-  // Deckelordnung, und die Leiter klettert mit echten Tupeln (p ab
-  // p+2).  Zwei Saetze statt Mischmatrix: eine Gram-Matrix aus zwei
-  // Historien waere keine.
-  std::vector<double> m_HybP2, m_HybQ2;        // frisch, nur junge Baender
+  std::vector<double> m_HybP, m_HybQ;          // [ch][bin][k][l] or [k]
+  // POWER-SAVING MODE: does the 1k chain really need to idle at order
+  // 6?  No.  Only the START order (hybWarmOrder) idles warm (a 2x2
+  // update instead of 6x6 is 1/7th the cost); once switched on, a
+  // SECOND, fresh accumulator builds up at the full cap order, and its
+  // ladder climbs as real tuples arrive (order p usable from p+2
+  // tuples).  Two separate accumulators rather than one mixed matrix:
+  // a single Gram matrix built from two different histories would not
+  // actually be a valid one.
+  std::vector<double> m_HybP2, m_HybQ2;        // fresh, young bands only
   std::vector<float> m_HybCoefRe, m_HybCoefIm; // [ch][bin][AR_ORDER_MAX]
   std::vector<float> m_HybRootRe, m_HybRootIm;
-  std::vector<uint16_t> m_HybAge; // [ch][ROUTE_BANDS] Perioden seit Reset
-  // ECHTE Tupel seit dem Reset, pro Kette.  Alter zaehlt Perioden, aber
-  // waehrend einer Ausfallkette laeuft keine Analyse - eine Leiter nach
-  // Alter loeste dann unterbestimmt (gemessen +7 dB NMR statt Gewinn).
+  std::vector<uint16_t> m_HybAge; // [ch][ROUTE_BANDS] periods since reset
+  // REAL tuples since the reset, per chain.  Age counts periods, but no
+  // analysis runs during a miss streak - an order ladder driven by age
+  // alone would then be underdetermined (measured +7 dB NMR instead of
+  // an improvement).
   std::vector<uint16_t> m_HybTupA, m_HybTupB; // [ch][ROUTE_BANDS]
-  std::vector<float> m_HybW;      // [ch][ROUTE_BANDS] Anteil kurze Kette
-  std::vector<uint8_t> m_HybAny;  // [ch] irgendein Band aktiv?
-  std::vector<uint64_t> m_HybEpStart; // [ch][band] Periode des Wechsels, ~0=zu
-  // RESIDUEN-WAEHLER (Nutzer-Go 08.08.): pro Band der geglaettete
-  // RELATIVE Ein-Schritt-Vorhersagefehler jeder Kette in ihrer eigenen
-  // Domaene, Sum|X - Xdach|^2 / Sum|X|^2 - relative Fehler sind ueber
-  // Rahmengroessen vergleichbar.  Gespielt wird, wer besser vorhersagt.
-  // GEMESSEN GESCHEITERT als Vorgabe (08.08., zwei Iterationen samt
-  // Energie-Tor): der EIN-Schritt-Fehler misst NACHFUEHRUNG, die
-  // Verdeckung braucht EXTRAPOLATION ueber den 32-ms-Horizont.  Die
-  // kurze Kette ist auf Plateaus der bessere Nachfuehrer (80 ms
-  // Gedaechtnis folgt der Schwebung), aber der schlechtere
-  // Extrapolator - der Waehler schaltete 3935x fern der Einsaetze
-  // (global +6.4 dB NMR statt -2.4).  Bleibt als Messknopf; ein
-  // MEHR-Schritt-Residuum waere der naechste Kandidat.
+  std::vector<float> m_HybW;      // [ch][ROUTE_BANDS] short-chain weight
+  std::vector<uint8_t> m_HybAny;  // [ch] is any band active?
+  std::vector<uint64_t> m_HybEpStart; // [ch][band] period of the switch, ~0=off
+  // RESIDUAL-BASED CHOOSER: per band, the smoothed RELATIVE one-step
+  // prediction error of each chain in its own domain,
+  // sum|X - Xhat|^2 / sum|X|^2 - relative errors are comparable across
+  // frame sizes.  Whichever chain predicts better gets played.
+  // MEASURED TO FAIL as a default (two iterations, including an energy
+  // gate): the ONE-STEP error measures TRACKING, while concealment
+  // needs EXTRAPOLATION over the full ~32 ms horizon.  The short chain
+  // is the better tracker on plateaus (its 80 ms memory follows
+  // beating), but the worse extrapolator - the chooser kept switching
+  // far from actual onsets (3935 spurious switches measured, +6.4 dB
+  // NMR overall instead of -2.4).  Kept as a measurement knob; a
+  // multi-step residual would be the next thing to try.
   std::atomic<int> m_HybChooser{0};
-  // ---- 512er-VORSTUFE (zweistufiges Schalten, Nutzer-Go 08.08.) ----
-  // Die Breite auf 512er-Rahmen kreuzt 13-29 ms nach dem physischen
-  // Anschlag - Augen-Paritaet (Nutzer-Messung: +24/+18 ms) und 10-15 ms
-  // vor dem 2k-Detektor.  Ihre Trennreserve ist hauchduenn (Stoermax
-  // 0.401, Einsatz-Min 0.424), deshalb schaltet sie nur VORLAEUFIG:
-  // bestaetigt der 2k-Detektor nicht binnen TENT_TTL Perioden, wird
-  // zurueckgezogen - die lange Kette wurde nie angetastet und spielt
-  // sofort wieder in voller Ordnung (Idee des Nutzers: Fehlalarme sind
-  // billig, wenn man sie rueckwirkend erkennt).
+  // ---- 512-sample PRE-STAGE (two-stage switching) -----------------------
+  // The 512-sample-frame boundary is crossed 13-29 ms after the
+  // physical note onset - roughly eye-parity timing, and 10-15 ms ahead
+  // of the 2k detector.  Its separation margin is razor-thin (noise
+  // floor max 0.401, onset min 0.424), so it only switches
+  // PROVISIONALLY: if the 2k detector has not confirmed within
+  // TENT_TTL periods, the switch is withdrawn - the long chain was
+  // never actually touched and immediately resumes at full order
+  // (rationale: a false alarm is cheap as long as it can be recognised
+  // and undone after the fact).
   static constexpr unsigned PRE_NFFT = 512;
   static unsigned preVeto() {
     static const unsigned v = [] {
@@ -1560,29 +1586,31 @@ struct Xorcist {
 
     return v;
   }
-  static constexpr unsigned PRE_RING = 9; // aktuelle + 8 Baseline
+  static constexpr unsigned PRE_RING = 9; // current + 8 baseline slots
   std::atomic<int> m_HybPre{0};
   std::atomic<int> m_HybSimple{0};
-  // Der ERSTE Detektor sah durch die 4k-ANALYSE (Schwellen 0.25/0.12,
-  // gehalten p99 0.217) - mit der 2k-Hybrid-Basis erbte die Erkennung
-  // das halb so lange, doppelt so zappelige Fenster (p99 0.268).  Der
-  // Simpel-Modus bekommt seine 4k-Augen zurueck: eine eigene
-  // 4k-Analyse NUR fuer die Erkennung, eine FFT pro Periode,
-  // unabhaengig vom Verdeckungsrahmen.
+  // The ORIGINAL detector looked through a 4k ANALYSIS window
+  // (thresholds 0.25/0.12, held-note p99 of 0.217) - once onset
+  // detection started piggybacking on the 2k hybrid base frame instead,
+  // it inherited a window half as long and twice as jittery (p99 of
+  // 0.268).  Simplified-detector mode gets its 4k view back: its own
+  // dedicated 4k analysis purely for detection, one FFT per period,
+  // independent of whatever frame size concealment itself is using.
   std::vector<float> m_D4Band;    // [ch][9][ROUTE_BANDS]
   std::vector<uint64_t> m_D4Per;  // [ch][9]
   std::vector<float> m_D4Wide;    // [ch], -1 = ungueltig
   std::vector<uint8_t> m_D4Rise;  // [ch][ROUTE_BANDS]
-  std::vector<uint8_t> m_D4Conf;  // [ch][ROUTE_BANDS] residuen-bestaetigt
-  // Abklingendes MAXIMUM des Residuums je Band.  Der Momentanwert reicht
-  // nicht: das Residuum eines schwachen Einsatzes kreuzt erst ein paar
-  // Perioden nach der Breitenschwelle (in den Vorstufen-Messungen der
-  // Einsatz bei 7,26 s).  Die Vorstufe fuehrte deshalb ein Maximum ueber
-  // ihr Prueffenster mit; hier tut es ein Abkling-Maximum, das kein
-  // Fenster verwalten muss.
+  std::vector<uint8_t> m_D4Conf;  // [ch][ROUTE_BANDS] residual-confirmed
+  // Decaying MAXIMUM of the residual per band.  The instantaneous value
+  // is not enough: a weak onset's residual only crosses the width
+  // threshold a few periods after the rise threshold itself does.  The
+  // pre-stage used to keep a maximum over its own test window for this;
+  // here a decaying maximum does the same job without needing to manage
+  // a window.
   std::vector<float> m_D4ResMax; // [ch][ROUTE_BANDS]
-  // Live regelbar (Regler im Wirt); die Umgebungsvariablen setzen nur den
-  // Startwert, damit ein Skript sie weiter vorgeben kann.
+  // Adjustable live (via a control in the host application); the
+  // environment variables only set the starting value, so a script can
+  // still drive them.
   std::atomic<float> m_D4ResGate{[] {
     const char *e = getenv("XO_D4_RES");
 
@@ -1593,8 +1621,9 @@ struct Xorcist {
 
     return e ? (float)atof(e) : 0.85f;
   }()};
-  // Hindcast-Anker (siehe XorcistTuning::v0Hindcast) - Schalter im Wirt,
-  // XO_V0_SHADOW liefert nur den Startwert fuer Harness-Skripte.
+  // Hindcast anchor (see XorcistTuning::v0Hindcast) - the real switch
+  // lives in the host-visible tuning struct; XO_V0_SHADOW here only
+  // supplies the starting value for harness scripts.
   std::atomic<int> m_V0Hindcast{[] {
     const char *e = getenv("XO_V0_SHADOW");
 
@@ -1604,38 +1633,40 @@ struct Xorcist {
   std::vector<float> m_PreWin;
   std::vector<float> m_PreBandE;     // [ch][PRE_RING][ROUTE_BANDS]
   std::vector<uint64_t> m_PrePeriod; // [ch][PRE_RING], ~0 = leer
-  std::vector<uint8_t> m_HybTent;    // [ch][band] Countdown, 0 = fest
-  // WIEDERHOLEN STATT VERWERFEN (wie beim Patch-Waechter): steht die
-  // Breite ueber der Schaltlatte, aber das Spleiss-Veto blockiert,
-  // bleibt der Wechselwunsch 8 Perioden bestehen und feuert bei der
-  // naechsten veto-freien Gelegenheit.  Ohne das verhungerte der
-  // schwaechste Einsatz (7,30 s) bei 6000/min komplett: 4 Perioden
-  // ueber der Latte, alle mit Luecke in den letzten 3 Perioden.
-  std::vector<uint8_t> m_HybRetr;     // [ch][band] Episode zurueckgezogen?
-  // PERSISTENZ-CHECK der Vorstufe (Nutzer-Richtung 08.08., statt
-  // Gesamtenergie - die trennt doppelt gemessen falsch herum: der
-  // schwaechste Einsatz hebt sie kaum, die Schwebungsflanke schon).
-  // Stoerer sind DUENN: ihre gestiegenen Baender fallen binnen 1-2
-  // Perioden zurueck, ein neuer Ton BLEIBT oben.  4 Perioden nach der
-  // vorlaeufigen Schaltung wird gegen die EINGEFRORENE Vor-Schalt-
-  // Baseline geprueft: haelt weniger als die Haelfte der Rise-Menge,
-  // sofortiger Rueckzug (~11 ms statt 43); haelt sie, ist die
-  // Schaltung fest, ohne auf den 2k-Detektor zu warten.
-  // Kandidaten-Disziplin der ERSTEN Detektor-Implementation (Nutzer:
-  // "die war zuverlaessiger"), auf die 512er portiert: ein Kandidat
-  // entsteht an der ON-Kreuzung, und bis er sich unter OFF beruhigt
-  // hat (6 Perioden) oder verfaellt (TTL 96), entsteht KEIN zweiter -
-  // ein sauberes Ereignis pro Anschlag statt Schwellen-Geflatter.
-  std::vector<uint64_t> m_PreCandP;   // [ch] Kandidaten-Periode, ~0 = frei
-  std::vector<uint8_t> m_PreStable;   // [ch] Perioden unter OFF am Stueck
-  std::vector<float> m_PreEmax;       // [ch] laufendes Energiemaximum
-  std::vector<uint8_t> m_PreChk;      // [ch] Countdown bis zum Check
-  std::vector<float> m_PreResMax;     // [ch] max resA-Mittel seit Zuendung
-  std::vector<float> m_PreResMaxB;    // [ch][band] dito pro Band
-  std::vector<float> m_PreBase;       // [ch][band] eingefrorene Baseline
-  std::vector<uint8_t> m_PreRise;     // [ch][band] urspruengliche Rises
-  std::vector<uint8_t> m_HybPend;     // [ch] Countdown Wechselwunsch
-  std::vector<uint8_t> m_HybPendRise; // [ch][band] Vereinigung der Rises
+  std::vector<uint8_t> m_HybTent;    // [ch][band] countdown, 0 = settled
+  // RETRY RATHER THAN DROP (same pattern as the patch guard): if the
+  // width is above the switch latch but the splice veto is blocking,
+  // the switch request stays pending for 8 periods and fires at the
+  // next veto-free opportunity.  Without this, the weakest onset in one
+  // test (at 6000 misses/min) starved completely: 4 periods above the
+  // latch, every one of them with a gap in its last 3 periods.
+  std::vector<uint8_t> m_HybRetr;     // [ch][band] was the episode withdrawn?
+  // PERSISTENCE CHECK of the pre-stage, used instead of total energy -
+  // which was measured to separate the wrong way round: the weakest
+  // onset barely raises it, while a beating edge raises it a lot.
+  // Spurious triggers are THIN: their risen bands fall back within 1-2
+  // periods, while a genuine new note STAYS up.  4 periods after the
+  // provisional switch, the current state is checked against the
+  // FROZEN pre-switch baseline: if less than half of the originally
+  // risen set still holds, the switch is withdrawn immediately
+  // (roughly 11 ms instead of 43); if it holds, the switch is confirmed
+  // without waiting for the 2k detector.
+  // Candidate discipline ported over from the earlier, more reliable
+  // detector implementation, adapted to the 512-sample stage: a
+  // candidate is created at the ON crossing, and until it either
+  // settles below OFF (6 periods) or expires (TTL 96), no second
+  // candidate can be created - one clean event per onset instead of
+  // threshold chatter.
+  std::vector<uint64_t> m_PreCandP;   // [ch] candidate period, ~0 = none
+  std::vector<uint8_t> m_PreStable;   // [ch] consecutive periods below OFF
+  std::vector<float> m_PreEmax;       // [ch] running energy maximum
+  std::vector<uint8_t> m_PreChk;      // [ch] countdown to the persistence check
+  std::vector<float> m_PreResMax;     // [ch] max resA mean since the trigger
+  std::vector<float> m_PreResMaxB;    // [ch][band] same, per band
+  std::vector<float> m_PreBase;       // [ch][band] frozen baseline
+  std::vector<uint8_t> m_PreRise;     // [ch][band] original rise set
+  std::vector<uint8_t> m_HybPend;     // [ch] pending-switch countdown
+  std::vector<uint8_t> m_HybPendRise; // [ch][band] union of the rise sets
 
   std::vector<float> m_HybResA, m_HybResB; // [ch][ROUTE_BANDS], EMA
   std::vector<float> m_HybEneB;            // [ch][ROUTE_BANDS], EMA-Energie
@@ -1646,9 +1677,10 @@ struct Xorcist {
     return m_HybAge[(size_t)ch * ROUTE_BANDS + band] != HYB_DORMANT;
   }
 
-  // Eine Periode 1k-Analyse: ein Rahmen, ein Ring-Slot, RLS nur fuer
-  // junge Baender (ausserhalb wird die kurze Kette nie gehoert, und der
-  // Anschlag setzt ohnehin zurueck).  Laeuft auch im Absorb-Pfad.
+  // One period's worth of 1k analysis: one frame, one ring slot, RLS
+  // update only for young bands (the short chain is never heard outside
+  // them anyway, and a note onset resets them regardless).  Also runs
+  // on the Absorb() path.
   void HybridAnalyze(unsigned ch, uint64_t nowP) {
     if (m_HistFill.load(std::memory_order_relaxed) < HYB_NFFT)
       return;
@@ -1684,10 +1716,10 @@ struct Xorcist {
     if (nowP < cap)
       return;
 
-    // B-RESIDUUM: wie gut haetten die AKTUELLEN B-Koeffizienten diesen
-    // Rahmen aus den Ring-Lags vorhergesagt?  VOR dem Akkumulieren und
-    // VOR dem Solve - der Praediktor wird an Daten gemessen, die er
-    // noch nicht gesehen hat.
+    // CHAIN-B RESIDUAL: how well would the CURRENT chain-B coefficients
+    // have predicted this frame from the ring's lagged values?  Checked
+    // BEFORE accumulating and BEFORE solving - the predictor is being
+    // scored against data it has not seen yet.
     if (chooser) {
       bool lagOk2 = true;
       const float *lRe[AR_ORDER_MAX], *lIm[AR_ORDER_MAX];
@@ -1743,12 +1775,13 @@ struct Xorcist {
       }
     }
 
-    // BACKFILL wie bei der langen Kette: waehrend einer Ausfallkette
-    // laeuft keine Analyse, der Ring bekommt Loecher - die SAMPLES sind
-    // aber da (Selbstfuetterung).  Ohne Reparatur baute die Synthese
-    // ihren Zustand aus Nullen und die kurze Kette spielte STILLE in
-    // genau die Baender, die sie tragen soll - gemessen als +13 dB NMR
-    // statt Gewinn, die exakte Wiederholung des alten AR-Pfad-Lochs.
+    // BACKFILL, same idea as on the long chain: no analysis runs during
+    // a miss streak, so the ring develops holes - but the SAMPLES
+    // themselves do exist (via the self-feed).  Without this repair,
+    // synthesis built its state out of zeros and the short chain ended
+    // up playing SILENCE into exactly the bands it is supposed to
+    // carry - measured as +13 dB NMR instead of an improvement, an
+    // exact repeat of the long chain's original AR-path hole.
     for (unsigned j = 1; j <= cap; j++) {
       if (nowP < j)
         break;
@@ -1784,9 +1817,9 @@ struct Xorcist {
       m_HybRingPeriod[(size_t)ch * HYB_RING + sl2] = want;
     }
 
-    // Akkumuliert wird IMMER bei der Deckelordnung: P[k][l] ist
-    // geschachtelt, der linke obere p x p Block IST das Ordnung-p-System
-    // - jede Leitersprosse loest nur einen Unterblock.
+    // Accumulation always happens at the cap order: P[k][l] is nested,
+    // so the top-left p x p block IS the order-p system by itself -
+    // each rung of the ladder just solves a sub-block of it.
     const double lam = ArLambda(cap);
     const float *lagRe[AR_ORDER_MAX], *lagIm[AR_ORDER_MAX];
     bool lagOk = true;
@@ -1796,7 +1829,7 @@ struct Xorcist {
       const unsigned ks = (unsigned)(want % HYB_RING);
 
       if (m_HybRingPeriod[(size_t)ch * HYB_RING + ks] != want) {
-        lagOk = false; // Loch im Ring: Tupel dieser Periode auslassen
+        lagOk = false; // hole in the ring: skip this period's tuple
         break;
       }
       lagRe[k - 1] = m_HybRingRe.data()
@@ -1811,11 +1844,12 @@ struct Xorcist {
     const size_t qStride = (size_t)AR_ORDER_MAX * 2;
     const uint16_t *age = m_HybAge.data() + (size_t)ch * ROUTE_BANDS;
 
-    // SPARBETRIEB: warm laeuft fuer alle Baender nur die STARTordnung
-    // (hybWarmOrder, Vorgabe 2 - 2x2 statt 6x6 = 1/7 der Kosten); die
-    // volle Deckelordnung akkumuliert ein zweiter, FRISCHER Satz nur in
-    // jungen Baendern.  hybWarmOrder 0 = alter Vollbetrieb.  Im
-    // Waehler-Modus immer voll (der braucht cap-Residuen ueberall).
+    // POWER-SAVING MODE: all bands idle warm at only the START order
+    // (hybWarmOrder, default 2 - a 2x2 update instead of 6x6 is 1/7th
+    // the cost); the full cap order is accumulated by a second, FRESH
+    // set only in young bands.  hybWarmOrder 0 = the old full-order
+    // behaviour.  Always full in chooser mode (it needs cap-order
+    // residuals everywhere).
     const int woRaw = m_HybWarmOrder.load(std::memory_order_relaxed);
     const unsigned warmOrd = chooser
       ? cap
@@ -1855,7 +1889,7 @@ struct Xorcist {
         if (warmOrd >= cap || !young)
           continue;
 
-        // Frischer Satz bei voller Deckelordnung, nur solange jung.
+        // Fresh accumulator at the full cap order, only while still young.
         double *P2 = m_HybP2.data()
           + ((size_t)ch * HYB_NBINS + bin) * pStride;
         double *Q2 = m_HybQ2.data()
@@ -1877,8 +1911,8 @@ struct Xorcist {
       }
     }
 
-    // Waehler-Modus: B kontinuierlich LOESEN (gestreift), damit
-    // Residuum und Synthese jederzeit aktuelle Koeffizienten sehen.
+    // Chooser mode: continuously SOLVE chain B (striped), so the
+    // residual check and synthesis always see up-to-date coefficients.
     if (chooser) {
       const int se = m_SolveEvery.load(std::memory_order_relaxed);
       const unsigned cycle = se > 0 ? (unsigned)se : 16u;
@@ -1907,12 +1941,13 @@ struct Xorcist {
     }
   }
 
-  // Bandalter und Gewichte fortschreiben, einmal pro Periode.
+  // Advance band age and weights, once per period.
   void HybridTick(unsigned ch, unsigned strideA, unsigned orderA,
                   uint64_t nowP) {
-    // DIAGNOSE: alle Baender dauerhaft auf der kurzen Kette.  Muss
-    // dieselben Zahlen liefern wie die pure 1k-Strategie bei
-    // Deckel-Ordnung - misst Maske + B-Synthese isoliert.
+    // DIAGNOSTIC: force all bands permanently onto the short chain.
+    // Should produce the same numbers as a pure 1k strategy at the cap
+    // order - isolates the mask-and-chain-B-synthesis logic for
+    // measurement.
     static const bool force = getenv("XO_HYB_FORCE") != nullptr;
 
     if (force) {
@@ -1928,15 +1963,15 @@ struct Xorcist {
       return;
     }
     const int handRaw = m_HybHandOrder.load(std::memory_order_relaxed);
-    // OHNE Klemme auf AR_ORDER_MAX: im Alter-Modus ist der Wert reine
-    // ZEITsteuerung ((X+2) Rasterpunkte der langen Kette), und der
-    // 200-ms-Haltetest des Nutzers braucht X=36 bei 2k.  Nur der
-    // Reset-Modus liest ihn als Ordnung, und dort verhungert ein
-    // uebergrosser Wert harmlos in der Schlaf-Bedingung.
+    // NOT clamped to AR_ORDER_MAX: in age-tracking mode this value is
+    // purely a TIME control ((X+2) grid points of the long chain), and
+    // a long 200 ms held-note test needs X=36 at PV 2k.  Only
+    // reset-mode reads it as an actual order, and there an oversized
+    // value just harmlessly stalls on the sleep condition.
     const unsigned hand = (unsigned)std::max(1, handRaw > 0 ? handRaw : 6);
     const unsigned handP = (hand + 2) * strideA;
-    // Schlafen erst, wenn auch die lange Kette ihre volle Ordnung wieder
-    // traegt - bis dahin braucht ihr Loeser die Leiter.
+    // Do not go dormant until the long chain has its full order back
+    // too - its own solver still needs the ladder until then.
     const unsigned dormP = std::max(handP, (orderA + 2) * strideA) + 8;
     uint16_t *age = m_HybAge.data() + (size_t)ch * ROUTE_BANDS;
     float *w = m_HybW.data() + (size_t)ch * ROUTE_BANDS;
@@ -1945,9 +1980,10 @@ struct Xorcist {
       = m_HybChooser.load(std::memory_order_relaxed) != 0;
     const float *rA = m_HybResA.data() + (size_t)ch * ROUTE_BANDS;
     const float *rB = m_HybResB.data() + (size_t)ch * ROUTE_BANDS;
-    // Hysterese: zu B erst bei KLAR besserer Vorhersage (Faktor 0.5),
-    // zurueck zu A, sobald A schlicht besser ist.  Dazwischen bleibt
-    // der Zustand - kein Flattern auf Rauschen.
+    // Hysteresis: switch to chain B only once it predicts CLEARLY
+    // better (factor 0.5), switch back to A as soon as A is simply
+    // better.  The state stays put in between - no chattering on
+    // noise.
     static const float toB = [] {
       const char *e = getenv("XO_HYB_HYST");
 
@@ -1958,15 +1994,16 @@ struct Xorcist {
       if (chooser) {
         const bool onNow = w[b] > 0.5f;
         bool want = onNow;
-        // ENERGIE-TOR: in leisen Baendern ist der relative Fehler
-        // beider Ketten ~1 und verrauscht - die Entscheidung wuerfelte
-        // (404 Episoden fern der Einsaetze, teils VOR dem Anschlag).
-        // Ohne nennenswerte Energie gibt es nichts zu waehlen: A.
+        // ENERGY GATE: in quiet bands the relative error of both chains
+        // is ~1 and noisy - the decision was essentially random there
+        // (404 spurious episodes measured far from actual onsets, some
+        // even BEFORE the onset).  Without meaningful energy present
+        // there is nothing to choose between, so default to chain A.
         const float *eb = m_HybEneB.data() + (size_t)ch * ROUTE_BANDS;
         static const float eneFloorRel = [] {
           const char *e = getenv("XO_HYB_ENEFLOOR");
 
-          return e ? (float)atof(e) : 1e-5f; // -50 dB unterm Maximum
+          return e ? (float)atof(e) : 1e-5f; // -50 dB below the maximum
         }();
         float eMax = 0.0f;
 
@@ -1985,7 +2022,7 @@ struct Xorcist {
           else if (age[b] < 60000)
             age[b]++;
         }
-        // Episoden-Protokoll (wie unten, gleiche Kodierung).
+        // Episode log (same encoding as the block below).
         {
           uint64_t &ep = m_HybEpStart[(size_t)ch * ROUTE_BANDS + b];
 
@@ -2019,37 +2056,40 @@ struct Xorcist {
       if (age[b] < 60000)
         age[b]++;
 
-      // RUECKZUG: vorlaeufig geschaltete Baender, die der 2k-Detektor
-      // binnen TTL nicht bestaetigt, gehen sofort zurueck - Ziel 0,
-      // die nie angetastete lange Kette spielt wieder voll.
+      // WITHDRAWAL: provisionally switched bands the 2k detector does
+      // not confirm within the TTL go back immediately - target 0, and
+      // the long chain, having never actually been touched, plays at
+      // full order again right away.
       {
         uint8_t &tn = m_HybTent[(size_t)ch * ROUTE_BANDS + b];
 
         if (tn && --tn == 0 && age[b] < handP) {
           age[b] = (uint16_t)handP;
-          // ZURUECKGEZOGEN: die Vorstufe hat geschaltet, der
-          // 2k-Detektor nie bestaetigt - die Episode endet gleich und
-          // wird im Log als Rueckzug geflaggt (Bit 15), das Lab malt
-          // sie orange statt blau.
+          // WITHDRAWN: the pre-stage switched, the 2k detector never
+          // confirmed it - the episode ends right here and is flagged
+          // as a withdrawal in the log (bit 15); the lab's display
+          // draws it in orange instead of blue.
           m_HybRetr[(size_t)ch * ROUTE_BANDS + b] = 1;
         }
       }
 
-      // Weich in der ZEIT: ~3 Perioden Rampe, gegenlaeufig in beiden
-      // Ketten (dieselbe Gewichtsfunktion, 1 - w drueben).
-      // OHNE Reset entscheidet das ALTER (die lange Kette laeuft ja
-      // ungestoert weiter, es gibt kein "traegt endlich" zu erwarten);
-      // MIT Reset datengetrieben: erst wenn ihr frischer Fit die
-      // Uebergabe-Ordnung wirklich TRAEGT (hand+2 echte Tupel - unter
-      // Ausfallketten kommen Tupel spaeter als die Uhr).
+      // Smoothed in TIME: a ramp of roughly 3 periods, running opposite
+      // in the two chains (the same weight function, 1 - w on the other
+      // side).
+      // WITHOUT reset, AGE decides (the long chain keeps running
+      // undisturbed, so there is no "finally catches up" moment to wait
+      // for); WITH reset, it is data-driven: only once its fresh fit
+      // genuinely SUPPORTS the hand-back order (hand+2 real tuples -
+      // during a miss streak, tuples arrive later than the clock
+      // would suggest).
       const float tgt = m_HybReset.load(std::memory_order_relaxed)
         ? (m_HybTupA[(size_t)ch * ROUTE_BANDS + b] < hand + 2 ? 1.0f : 0.0f)
         : (age[b] < handP ? 1.0f : 0.0f);
-      // AUFWAERTS sofort: unter der BINAEREN Maske hat die Rampe nach
-      // oben keine Funktion mehr (gehoert wird erst ab w > 0.5) - sie
-      // kostete nur 2 Perioden = 5,3 ms zusaetzlichen Verzug, und der
-      // Detektor ist ohnehin 27-40 ms hinter dem physischen Anschlag.
-      // Abwaerts bleibt die Rampe als Entprellung der Uebergabe.
+      // UPWARD immediately: under the BINARY mask (only w > 0.5 is
+      // actually heard), ramping upward serves no purpose - it only
+      // cost 2 extra periods (5.3 ms) of needless delay, and the
+      // detector is already 27-40 ms behind the physical onset anyway.
+      // Downward, the ramp still serves as debouncing for the handover.
       const float d = tgt - w[b];
 
       w[b] += d > 0.0f ? d : (d < -0.34f ? -0.34f : d);
@@ -2057,8 +2097,9 @@ struct Xorcist {
         w[b] = 0.0f;
       if (w[b] > 1.0f)
         w[b] = 1.0f;
-      // Episoden-Protokoll: Wechsel der BINAEREN Maske (w kreuzt 0.5)
-      // ergibt Start/Ende eines Rechtecks im Spektrogramm des Labs.
+      // Episode log: a transition of the BINARY mask (w crossing 0.5)
+      // produces the start/end of one rectangle in the lab's
+      // spectrogram display.
       {
         const bool onNow = w[b] > 0.5f;
         uint64_t &ep = m_HybEpStart[(size_t)ch * ROUTE_BANDS + b];
@@ -2101,59 +2142,62 @@ struct Xorcist {
     m_HybAny[ch] = any;
   }
 
-  // Anschlag: betroffene Baender (um 1 dilatiert - der Einsatz waechst
-  // ueber Perioden in die Nachbarbaender) in BEIDEN Ketten zuruecksetzen.
+  // Note onset: reset the affected bands (dilated by 1 - the onset
+  // spreads into neighbouring bands over a few periods) in BOTH chains.
   void HybridOnset(
     unsigned ch, const uint8_t *rise, unsigned nbinsA, unsigned shiftA,
     bool tentative) {
-    // Derselbe Anschlag zuendet nicht doppelt - aber die Sperre darf
-    // nur die EIGENZEIT eines Anschlags decken (Breite bleibt 8-24
-    // Perioden oben), nicht 128 ms: Motor-/Vorlaeufer-Ereignisse 50-130
-    // ms vor einem echten Einsatz sperrten dessen Baender mit, der
-    // zweite Ton wurde erst nach Ablauf erkannt (+60 ms, als spaeter
-    // 2k-Vollblock statt Per-Band - Nutzer-Beobachtung 08.08.).
+    // The same onset must not trigger twice - but the lockout must only
+    // cover one onset's OWN duration (width stays at 8-24 periods), not
+    // a full 128 ms: pre-onset transient events 50-130 ms before a real
+    // onset were locking out its bands too, so the second note was only
+    // detected after the lockout expired (a 60 ms-late detection, as a
+    // later 2k full-block hit instead of a clean per-band one).
     static const unsigned rejoinEnv = [] {
       const char *e = getenv("XO_HYB_REJOIN");
 
-      // 16 statt 12: bei 6000/min aequivalent, aber 11 ms mehr Ruhe
-      // innerhalb eines Anschlags.  Der beobachtete 60-ms-Fall braucht
-      // nur <= 18 (Vorlaeufer 2.79 s -> Einsatz 2.84 s = 19 Perioden).
+      // 16 rather than 12: equivalent at 6000 misses/min, but gives
+      // 11 ms more quiet time within a single onset.  The observed
+      // 60 ms-late case only needs <= 18 (precursor at 2.79 s -> real
+      // onset at 2.84 s = 19 periods).
       return e ? (unsigned)atoi(e) : 16u;
     }();
     const unsigned REJOIN
       = m_HybSimple.load(std::memory_order_relaxed) ? 48u : rejoinEnv;
-    // Bestaetigungsfenster: 2k-Erkennung kommt bis ~27 ms nach der
-    // Vorstufe; 16 Perioden = 43 ms decken das mit Reserve.
+    // Confirmation window: 2k detection can arrive up to ~27 ms after
+    // the pre-stage; 16 periods (43 ms) covers that with margin.
     static const unsigned TENT_TTL = [] {
       const char *e = getenv("XO_PRE_TTL");
 
       return e ? (unsigned)atoi(e) : 16u;
     }();
-    // Diagnose (XO_HYB_ALLBANDS=1): beim Einsatz schalten ALLE Baender
-    // auf die kurze Kette, nicht nur die steigenden.  Trennt fuer den
-    // Hoertest "falsche Bandauswahl" von "falsches Timing": klingt es
-    // damit wie pures 1k am Transienten, war die Auswahl schuld.
+    // Diagnostic (XO_HYB_ALLBANDS=1): on an onset, switch ALL bands to
+    // the short chain, not just the rising ones.  Separates, for
+    // listening tests, "wrong band selection" from "wrong timing": if
+    // this makes it sound like pure 1k at the transient, selection was
+    // the problem.
     if (m_HybChooser.load(std::memory_order_relaxed))
-      return; // der Residuen-Waehler schaltet selbst - Detektor nur Anzeige
+      return; // the residual chooser switches on its own - detector is display-only
 
     static const bool envAll = getenv("XO_HYB_ALLBANDS") != nullptr;
-    // Probephase NUR mit steigenden Baendern wurde gemessen und
-    // VERWORFEN (global -1.40 -> -1.11): der Schwebungs-Preis bei
-    // Stressdichte kommt nicht von den 11-ms-Probeschlaegen.
+    // A trial using ONLY the rising bands was measured and REJECTED
+    // (global -1.40 -> -1.11): the beating cost under dense miss rates
+    // does not come from the ~11 ms trial strikes.
     const bool allBands
       = envAll || m_HybAllBands.load(std::memory_order_relaxed) != 0;
     uint16_t *age = m_HybAge.data() + (size_t)ch * ROUTE_BANDS;
     const size_t pStride = (size_t)AR_ORDER_MAX * AR_ORDER_MAX * 2;
     const size_t qStride = (size_t)AR_ORDER_MAX * 2;
-    // Zaehlung der ZUENDUNGEN (Nutzerwunsch 10.08.2026): auf gehaltenem
-    // Klang darf hier nichts passieren, und wenn doch, will man es sehen
-    // statt es zu vermuten.  Vorlaeufige Zuendungen der 512er-Vorstufe
-    // getrennt, weil sie widerrufen werden koennen; GO faehrt sie nicht.
-    // Gezaehlt wird nur die WIRKSAME Zuendung, also die, bei der wirklich
-    // mindestens ein Band auf die kurze Kette wechselt.  Aufrufe, die die
-    // REJOIN-Sperre komplett abfaengt, sind kein Ereignis, das man hoert -
-    // sie mitzuzaehlen blaeht die Zahl um das Fuenffache auf (124 statt 25
-    // im selben Lauf) und macht die Anzeige unbrauchbar.  JE KANAL.
+    // Counting TRIGGERS: on held material nothing here should fire at
+    // all, and if it does, that should be visible rather than merely
+    // suspected.  Provisional triggers from the 512-sample pre-stage
+    // are counted separately because they can still be withdrawn (not
+    // used by GrandOrgue).  Only an EFFECTIVE trigger is counted - one
+    // where at least one band genuinely switches to the short chain.
+    // Calls that the REJOIN lockout catches entirely are not an event
+    // anyone would hear - counting those too inflated the number
+    // roughly fivefold (124 instead of 25 in the same run) and made
+    // the display useless.  PER CHANNEL.
     unsigned armed = 0;
 
     for (unsigned b = 0; b < ROUTE_BANDS; b++) {
@@ -2165,8 +2209,9 @@ struct Xorcist {
 
       uint8_t &tn = m_HybTent[(size_t)ch * ROUTE_BANDS + b];
 
-      // BESTAETIGUNG: der echte Detektor macht aus vorlaeufig fest -
-      // auch wenn das Band schon jung ist und nicht neu gesetzt wird.
+      // CONFIRMATION: the real detector turns a provisional switch into
+      // a settled one - even if the band is already young and does not
+      // get reset here.
       if (!tentative)
         tn = 0;
       if (age[b] != HYB_DORMANT && age[b] < REJOIN)
@@ -2178,7 +2223,8 @@ struct Xorcist {
       m_HybAny[ch] = 1;
       armed++;
 
-      // Sparbetrieb: der frische cap-Satz beginnt bei der Schaltung.
+      // Power-saving mode: the fresh cap-order accumulator starts here,
+      // right as the switch happens.
       if (m_HybWarmOrder.load(std::memory_order_relaxed) > 0
           && !m_HybChooser.load(std::memory_order_relaxed)) {
         m_HybTupB[(size_t)ch * ROUTE_BANDS + b] = 0;
@@ -2193,12 +2239,12 @@ struct Xorcist {
         }
       }
       if (!m_HybReset.load(std::memory_order_relaxed))
-        continue; // nur Maske schalten - beide Ketten laufen ungestoert
+        continue; // only switch the mask - both chains keep running undisturbed
 
       m_HybTupA[(size_t)ch * ROUTE_BANDS + b] = 0;
       m_HybTupB[(size_t)ch * ROUTE_BANDS + b] = 0;
 
-      // Kurze Kette: Bins b*2 .. b*2+1
+      // Short chain: bins b*2 .. b*2+1
       for (unsigned bin = b << 1; bin < std::min(HYB_NBINS, (b + 1u) << 1);
            bin++) {
         std::fill_n(m_HybP.begin() + ((size_t)ch * HYB_NBINS + bin) * pStride,
@@ -2210,10 +2256,10 @@ struct Xorcist {
           m_HybRootIm[((size_t)ch * HYB_NBINS + bin) * AR_ORDER_MAX + k] = 0.0f;
         }
       }
-      // Lange Kette: Bins des Bandes bei deren Aufloesung.  Die alten
-      // KOEFFIZIENTEN bleiben absichtlich stehen - sie spielen die
-      // 2-3 Rampenperioden, bis die Maske drueben ist; danach schreibt
-      // die Leiter frische.
+      // Long chain: the band's bins at ITS resolution.  The old
+      // COEFFICIENTS are deliberately left in place - they are what
+      // plays during the 2-3 ramp periods until the mask has fully
+      // switched over; after that the ladder writes fresh ones.
       for (unsigned bin = b << shiftA;
            bin < std::min(nbinsA, (b + 1u) << shiftA); bin++) {
         ClearBin(ch, bin);
@@ -2240,8 +2286,9 @@ struct Xorcist {
       RoundPeriod() * m_SamplesPerBuffer, std::memory_order_relaxed);
   }
 
-  // Junge Baender der LANGEN Kette: jede Periode frisch loesen, Ordnung
-  // nach Alter (Leiter auf dem frischen Akkumulator, Unterblock-Solve).
+  // Young bands of the LONG chain: solve fresh every period, order
+  // determined by age (the ladder, running against the fresh
+  // accumulator, as a sub-block solve).
   void HybridSolveLongYoung(
     unsigned ch, unsigned P, unsigned arStride, unsigned bandShift,
     unsigned nbins) {
@@ -2261,7 +2308,7 @@ struct Xorcist {
       (void)arStride;
 
       if (p < 1)
-        continue; // Maske haelt das Band ohnehin bei der kurzen Kette
+        continue; // the mask keeps this band on the short chain anyway
 
       for (unsigned bin = b << bandShift;
            bin < std::min(nbins, (b + 1u) << bandShift); bin++) {
@@ -2270,8 +2317,9 @@ struct Xorcist {
           gP, gQ, p,
           cRe + (size_t)bin * AR_ORDER_MAX, cIm + (size_t)bin * AR_ORDER_MAX,
           rRe + (size_t)bin * AR_ORDER_MAX, rIm + (size_t)bin * AR_ORDER_MAX);
-        // Schwanz nullen: der Vorlauf laeuft einheitlich bei P, und ein
-        // AR(p) IST ein AR(P) mit Nullen dahinter.
+        // Zero the tail: extrapolation always runs uniformly at order
+        // P, and an AR(p) model simply IS an AR(P) model with zeros
+        // past order p.
         for (unsigned k = p; k < P; k++) {
           cRe[(size_t)bin * AR_ORDER_MAX + k] = 0.0f;
           cIm[(size_t)bin * AR_ORDER_MAX + k] = 0.0f;
@@ -2280,12 +2328,13 @@ struct Xorcist {
     }
   }
 
-  // Synthese der kurzen Kette: nur junge Baender, mit w gewichtet, per
-  // eigener Ueberlappungsaddition in den fertigen Schatten addiert.
-  // pShadowM1: Hindcast-Sammelpunkt der NAHT (XO_V0_SHADOW) - die kurze
-  // Kette traegt ihr Sample vor der Grenze bei, sonst misst der Anker den
-  // Versatz nur gegen die lange Kette (gemessen: 0,5 dB Verlust, die
-  // geschalteten Baender sitzen genau an den Einsaetzen).  nullptr = aus.
+  // Short-chain synthesis: young bands only, weighted by w, added into
+  // the finished shadow via its own overlap-add.
+  // pShadowM1: hindcast collection point for the SEAM (XO_V0_SHADOW) -
+  // the short chain contributes its pre-boundary sample here too,
+  // otherwise the anchor would only measure its offset against the
+  // long chain (measured cost of not doing this: 0.5 dB, concentrated
+  // exactly where switched bands sit at onsets).  nullptr = off.
   void HybridSynth(
     unsigned ch, uint64_t nowP, float *pShadow, float *ola,
     float *pShadowM1) {
@@ -2299,8 +2348,8 @@ struct Xorcist {
     fftwf_complex *pFreq = m_FreqBuf + (size_t)ch * FREQ_STRIDE;
     const uint16_t *age = m_HybAge.data() + (size_t)ch * ROUTE_BANDS;
     const float *w = m_HybW.data() + (size_t)ch * ROUTE_BANDS;
-    // Wiederverwendeter Scratch: die lange Kette ist mit Zustand und
-    // Rotatoren dieser Periode fertig, bevor wir hier ankommen.
+    // Reused scratch space: the long chain has finished with this
+    // period's state and rotators by the time we get here.
     float *stRe = m_ArStRe.data() + (size_t)ch * AR_ORDER_MAX * NBINS_MAX;
     float *stIm = m_ArStIm.data() + (size_t)ch * AR_ORDER_MAX * NBINS_MAX;
     float *rotRe = m_RotRe.data() + (size_t)ch * NBINS_MAX;
@@ -2308,9 +2357,9 @@ struct Xorcist {
     const size_t pStride = (size_t)AR_ORDER_MAX * AR_ORDER_MAX * 2;
     const size_t qStride = (size_t)AR_ORDER_MAX * 2;
     unsigned pOfBand[ROUTE_BANDS];
-    float hybM1 = 0.0f, hybM1W = 0.0f; // Hindcast der kurzen Kette (t = -1)
+    float hybM1 = 0.0f, hybM1W = 0.0f; // short chain's hindcast (t = -1)
 
-    // 1) Loesen (Leiter) + Rotator-Rueckfall + Zustand einsammeln
+    // 1) Solve (ladder) + rotator fallback + collect state
     for (unsigned b = 0; b < ROUTE_BANDS; b++) {
       pOfBand[b] = 0;
       if (age[b] == HYB_DORMANT || w[b] <= 0.5f)
@@ -2319,19 +2368,22 @@ struct Xorcist {
       const int woRaw = m_HybWarmOrder.load(std::memory_order_relaxed);
       const unsigned warmOrd
         = woRaw > 0 ? std::min(cap, (unsigned)woRaw) : cap;
-      // warmOrd == cap MUSS Vollbetrieb sein: der frische Satz wird
-      // dann nie befuellt (die Akkumulation ueberspringt ihn korrekt),
-      // aber der Tupelzaehler lief weiter - nach ~24 ms Jung-Zeit
-      // loeste die Synthese aus dem LEEREN Akkumulator: Muell in den
-      // geschalteten Baendern.  Deshalb klang 'warm@6' SCHLECHTER als
-      // 'warm@0', obwohl beide dasselbe meinen (Nutzer-Hoerbefund
-      // 08.08.; die Messreihe hatte 6 nie getestet).
+      // warmOrd == cap MUST mean full-order operation: the fresh
+      // accumulator is then never populated (accumulation correctly
+      // skips it),
+      // but the tuple counter kept running anyway - after roughly
+      // 24 ms of "young" time, synthesis ended up solving from the
+      // EMPTY accumulator: garbage output in the switched bands.  That
+      // is why "warm@6" sounded WORSE than "warm@0", even though they
+      // mean the same thing (confirmed by listening; the original
+      // measurement series had never tested warm@6).
       const bool spar = woRaw > 0 && warmOrd < cap
         && !m_HybChooser.load(std::memory_order_relaxed);
       const unsigned tupF = m_HybTupB[(size_t)ch * ROUTE_BANDS + b];
-      // Sparbetrieb: bis der frische Satz mehr traegt als der
-      // Warmstart, loest die Warm-Ordnung; danach klettert die Leiter
-      // auf dem frischen Satz (p ab p+2 Tupeln).
+      // Power-saving mode: until the fresh accumulator supports more
+      // than the warm start, solve at the warm order; after that, the
+      // ladder climbs on the fresh accumulator (order p usable from
+      // p+2 tuples).
       const bool fresh = spar && tupF >= warmOrd + 3;
       const unsigned p = spar
         ? (fresh ? std::min(cap, tupF - 2) : warmOrd)
@@ -2364,8 +2416,9 @@ struct Xorcist {
             cI[k] = 0.0f;
           }
         } else {
-          // Leiter traegt noch nicht: Rotator aus den letzten zwei
-          // Ringrahmen (Baseline eine Periode).
+          // Ladder does not support any order yet: fall back to a
+          // rotator derived from the last two ring frames (a one-period
+          // baseline).
           const unsigned s0 = (unsigned)(nowP % HYB_RING);
           const unsigned s1 = (unsigned)((nowP - 1) % HYB_RING);
           float rr = 1.0f, ri = 0.0f;
@@ -2388,7 +2441,7 @@ struct Xorcist {
           rotRe[bin] = rr;
           rotIm[bin] = ri;
         }
-        // Zustand: st[k] = Ring[now - k], Loecher = 0
+        // State: st[k] = Ring[now - k], holes treated as 0
         for (unsigned k = 0; k < cap; k++) {
           float vr = 0.0f, vi = 0.0f;
 
@@ -2408,7 +2461,7 @@ struct Xorcist {
       }
     }
 
-    // 2) Rahmen-Schleife: Vorlauf, Maske w, iFFT, Ueberlappungsaddition
+    // 2) Frame loop: extrapolation, mask w, iFFT, overlap-add
     const unsigned kEnd = (m_ShadowLen + HYB_NFFT + synHop - 1) / synHop;
     const float *win = kit.win.data();
 
@@ -2459,7 +2512,7 @@ struct Xorcist {
       }
       for (unsigned b = 0; b < ROUTE_BANDS; b++) {
         if (age[b] == HYB_DORMANT || w[b] <= 0.5f)
-          continue; // binaer - siehe Maske der langen Kette
+          continue; // binary - mirrors the long chain's own mask
         for (unsigned bin = b << 1;
              bin < std::min(HYB_NBINS, (b + 1u) << 1); bin++) {
           pFreq[bin][0] = stRe[bin];
@@ -2486,8 +2539,8 @@ struct Xorcist {
     }
     for (unsigned i = 0; i < m_ShadowLen; i++)
       pShadow[i] += ola[i] * kit.olaRecip[i];
-    // Beitrag der kurzen Kette zum Hindcast - getrennt normiert, exakt
-    // wie ihr Beitrag zu pShadow selbst.
+    // The short chain's contribution to the hindcast - normalised
+    // separately, exactly like its contribution to pShadow itself.
     if (pShadowM1 && hybM1W > 1e-9f)
       *pShadowM1 += hybM1 / hybM1W;
   }
@@ -2517,9 +2570,10 @@ struct Xorcist {
   // time: a runtime trip count stopped the vectoriser and cost 25 % of
   // the whole prediction.  State layout is [k][bin] (structure of
   // arrays) so the bin loop is a straight stride-1 sweep.
-  // Auch planar - sonst haetten die Ordnungen jenseits der Schablonen
-  // stillschweigend die falsche Ablage gelesen.  Genau diese Sorte
-  // Halb-Umstellung war hier schon einmal ein -26 dB teurer Fehler.
+  // Also planar - otherwise orders beyond the templated fast path would
+  // have silently read from the wrong layout.  Exactly this kind of
+  // half-finished layout change has already been a -26 dB bug here
+  // once before.
   static void AdvanceBinsGeneric(
     unsigned P, unsigned nbins, const float *pCoefRe, const float *pCoefIm,
     float *pStRe, float *pStIm) {
@@ -2546,16 +2600,16 @@ struct Xorcist {
     }
   }
 
-  // Planare Fassung: pCoefRe/Im sind [k][bin], genau wie der Zustand.
-  // Damit sind ALLE Zugriffe der Bin-Schleife zusammenhaengend, und der
-  // Uebersetzer packt acht Bins in ein AVX2-Register.  Die alte Fassung
-  // (AdvanceBinsOld, steht als Referenz daneben) las die Koeffizienten mit
-  // Schrittweite AR_ORDER_MAX je Bin - ein Gather, den keine
-  // Vektorisierung ueberlebt.
+  // Planar version: pCoefRe/Im are laid out as [k][bin], exactly like
+  // the state.  That makes EVERY access in the bin loop contiguous, so
+  // the compiler can pack eight bins into one AVX2 register.  The older
+  // version (AdvanceBinsOld, kept alongside as a reference) read the
+  // coefficients with a stride of AR_ORDER_MAX per bin - a gather no
+  // vectoriser survives.
   //
-  // accRe/accIm sind EIGENER Kratzspeicher, nicht etwa freie Plaetze im
-  // Zustandsfeld: das ist exakt AR_ORDER_MAX * NBINS_MAX gross, bei
-  // Ordnung == AR_ORDER_MAX gibt es dort keinen Platz mehr.
+  // accRe/accIm are DEDICATED scratch space, not spare room inside the
+  // state array: that array is sized exactly AR_ORDER_MAX * NBINS_MAX,
+  // and at order == AR_ORDER_MAX there is no spare room left in it.
   template <unsigned P>
   static void AdvanceBins(
     unsigned nbins, const float *pCoefRe, const float *pCoefIm, float *pStRe,
@@ -2586,9 +2640,9 @@ struct Xorcist {
           accIm[bin] += aRe[bin] * sIm[bin] + aIm[bin] * sRe[bin];
         }
     }
-    // Zustand um einen Schritt schieben, dann das frische Ergebnis nach
-    // vorn.  Zusammenhaengende Bloecke - memmove-Geschwindigkeit statt
-    // Einzelwerten mit Schrittweite NBINS_MAX.
+    // Shift the state back by one step, then move the fresh result to
+    // the front.  Contiguous blocks - memmove speed instead of
+    // element-by-element copies at stride NBINS_MAX.
     for (unsigned k = P - 1; k > 0; k--) {
       std::memcpy(pStRe + (size_t)k * NBINS_MAX,
                   pStRe + (size_t)(k - 1) * NBINS_MAX,
@@ -2774,23 +2828,25 @@ Xorcist::Xorcist(
     m_HybEneB((size_t)nChannels * ROUTE_BANDS, 0.0f),
     m_FadeReentry(m_ReentryFade),
     m_DegradeHold((unsigned)(0.025 * sampleRate)),
-    // Die Ausblendung endet dort, wo der Schatten endet.
+    // The fade-out ends exactly where the shadow itself ends.
     //
-    // Vorher standen hier 150 ms - eine Kurve, die NIE durchlaufen wurde:
-    // sie braucht mit der Haltezeit 175 ms bis null, der Schatten ist aber
-    // nach m_HorizonPeriods (32 ms) alle.  Am letzten brauchbaren Wert
-    // stand sie bei 0,5 + 0,5*cos(pi*336/7200) = 99,5 %, und danach kam
-    // hartes Nichts.  Eine ununterbrochene Aussetzerkette laenger als
-    // 32 ms endete also in einem SCHNITT bei fast vollem Pegel, nicht in
-    // einem Ausblenden - unbemerkt geblieben, weil die erzwungenen
-    // Fehlschlaege (einzeln, paarweise, 1:1) so lange Ketten gar nicht
-    // erzeugen; das passiert nur unter echter Ueberlast.
+    // This used to be a fixed 150 ms - a curve that was NEVER actually
+    // run to completion: together with the hold time it needs 175 ms to
+    // reach zero, but the shadow runs out after m_HorizonPeriods
+    // (32 ms).  At the last usable value it sat at
+    // 0.5 + 0.5*cos(pi*336/7200) = 99.5%, and after that came a hard
+    // cutoff to nothing.  Any uninterrupted miss streak longer than
+    // 32 ms therefore ended in a near-full-level CUT, not a fade-out -
+    // this went unnoticed because the forced test patterns (single,
+    // paired, alternating) never produce streaks that long; only real
+    // overload does.
     //
-    // Jetzt: was zwischen Haltezeit und Horizont uebrig ist, wird zur
-    // Ausblendung - bei 128/48k also 336 Werte = 7 ms.  Sie kommt damit
-    // genau dann bei null an, wenn die letzte Scheibe verbraucht ist.
-    // In die letzte Scheibe allein gequetscht waeren es 2,7 ms; die
-    // vollen 7 ms sind derselbe Endpunkt, nur sanfter.
+    // Now: whatever time is left between the hold phase and the horizon
+    // becomes the fade - at 128 samples/48 kHz that is 336 samples
+    // (7 ms).  It therefore reaches zero at exactly the moment the last
+    // slice is used up.  Squeezed into just the final slice alone it
+    // would be 2.7 ms; the full 7 ms reaches the same endpoint, just
+    // more gently.
     m_DegradeFade(
       m_HorizonPeriods * samplesPerBuffer > m_DegradeHold
         ? m_HorizonPeriods * samplesPerBuffer - m_DegradeHold
@@ -2847,12 +2903,13 @@ Xorcist::Xorcist(
         && samplesPerBuffer <= kit.nfft / 4
       ? samplesPerBuffer
       : kit.nfft / 4;
-    // PERIODISCH (Nenner nfft) ist das richtige Fenster fuer die
-    // Ueberlappungsaddition - es erfuellt COLA bei Hop N/4.  Der
-    // Offline-Prototyp benutzt np.hanning, also SYMMETRISCH (Nenner
-    // N-1), mit exakten Nullen an beiden Raendern.  Ein Sample
-    // Unterschied, aber es aendert Nebenkeulendaempfung und
-    // Rekonstruktion; XO_SYM_WINDOW=1 gleicht es zum Vergleich an.
+    // A PERIODIC window (denominator nfft) is the correct choice for
+    // overlap-add - it satisfies COLA at hop N/4.  The offline
+    // prototype uses np.hanning instead, which is SYMMETRIC
+    // (denominator N-1) with exact zeros at both edges.  A one-sample
+    // difference, but it changes sidelobe suppression and
+    // reconstruction; XO_SYM_WINDOW=1 matches the symmetric form for
+    // comparison.
     static const unsigned symWin = getenv("XO_SYM_WINDOW") ? 1u : 0u;
 
     kit.win.resize(kit.nfft);
@@ -2909,7 +2966,8 @@ Xorcist::Xorcist(
 }
 
 Xorcist::~Xorcist() {
-  // k < 4: der 1k-Kit (Index 3) leckte seit seinem Einbau.
+  // k < 4: the 1k kit (index 3) was leaking its plans ever since it was
+  // added, until this loop's bound was corrected to cover it too.
   for (unsigned k = 0; k < 4; k++) {
     if (m_Pv[k].fwd)
       fftwf_destroy_plan(m_Pv[k].fwd);
@@ -2933,19 +2991,20 @@ double Xorcist::NextRand() {
 }
 
 void Xorcist::Push(const float *pInterleaved) {
-  // ---- Wiedereinstiegs-Fade AUCH in die Historie -----------------------
-  // Bis 06.08.2026 bekam der Ring nach einer Luecke die ROHE echte
-  // Periode, waehrend der Ausgang die ueberblendete Fassung hoerte.  Im
-  // Ring stand damit an jedem Kettenende ein harter Spleiss
-  // Vorhersage -> Wahrheit, dessen Sprunghoehe der aufgelaufene
-  // Vorhersagefehler ist.  Ein Sprung ist breitbandig, das
-  // Analysefenster 32 Perioden lang - jeder Spleiss verseuchte also 32
-  // folgende Analysen bis hinauf zu 24 kHz.  Das waren die vertikalen
-  // Striche im Spektrogramm und der als "Aufbau-Anteil" bezifferte
-  // Posten von 2,5 bis 3,3 dB.
+  // ---- re-entry fade ALSO applied into the history -----------------------
+  // The history ring used to receive the RAW real period right after a
+  // gap, while the actual output heard the crossfaded version instead.
+  // That left a hard splice prediction -> truth at the end of every
+  // miss streak in the ring, with a jump height equal to the
+  // accumulated prediction error.  A jump like that is broadband, and
+  // the analysis window spans 32 periods - so every splice contaminated
+  // the next 32 analyses, all the way up to 24 kHz.  That was the cause
+  // of the vertical streaks in the spectrogram, and of the "ramp-up"
+  // contribution measured at 2.5 to 3.3 dB.
   //
-  // Der Ausgang aendert sich dadurch NICHT - nur die Historie wird
-  // ehrlich und zeigt dem naechsten Fit, was tatsaechlich gespielt wurde.
+  // The actual OUTPUT does not change because of this - only the
+  // history becomes honest, showing the next fit what was really
+  // played.
   if (m_RingBlendPending) {
     m_RingBlendPending = false;
     if (m_FadeInRing.load(std::memory_order_relaxed)) {
@@ -2996,9 +3055,9 @@ void Xorcist::Push(const float *pInterleaved) {
         w = 0;
     }
   }
-  // Erst die Abtastwerte, dann der Kopf: ein Leser ohne eingefrorenen Kopf
-  // (Absorb, Patch-Pfad) darf nie einen Kopf sehen, hinter dem noch keine
-  // Daten stehen.
+  // Samples first, write head second: a reader without a frozen head
+  // (Absorb, the patch path) must never see a head that points past
+  // data which has not actually been written yet.
   m_HistWrite.store(w, std::memory_order_release);
   m_HistFill.store(
     std::min(HIST, m_HistFill.load(std::memory_order_relaxed) + buf),
@@ -3028,8 +3087,9 @@ bool Xorcist::FitBurg(unsigned ch, const float *hist, unsigned n) {
     f[i] = hist[i + 1];
     b[i] = hist[i];
   }
-  // Volle Breite nullen: bei geklemmter Ordnung (XO_V0_ORDER) lesen die
-  // Verbraucher weiterhin alle BURG_ORDER Taps - Altwerte oben waeren Gift.
+  // Zero the full width: with a clamped order (XO_V0_ORDER), consumers
+  // still read all BURG_ORDER taps - leftover stale values above the
+  // clamp would poison the result.
   std::fill(a, a + BURG_ORDER, 0.0);
 
   for (unsigned m = 0; m < order; m++) {
@@ -3245,8 +3305,8 @@ static void SchurClampUnit(double *ar, double *ai, unsigned order,
 void Xorcist::SolveBin(
   const double *pP, const double *pQ, unsigned order, float *pCoefRe,
   float *pCoefIm, float *pRootRe, float *pRootIm) {
-  // Nicht als Bereichsobjekt: die Funktion hat mehrere fruehe Ausgaenge,
-  // und die sollen alle mitzaehlen - deshalb SolveBinEnd() an jedem.
+  // Not as a scope object: the function has several early returns, and
+  // all of them need to count - hence SolveBinEnd() at each one.
   XoClock sbClock(XoProfiling());
   struct End {
     XoClock &c;
@@ -3329,8 +3389,8 @@ void Xorcist::SolveBin(
       return;
     }
   }
-  // Messung ohne Verhaltensaenderung: bestuende dieser Bin den
-  // rho-Schur-Test auf den ROHEN Gauss-Koeffizienten?
+  // Measurement only, no behavior change: would this bin pass the
+  // rho-Schur test on the RAW Gaussian-elimination coefficients?
   {
     static const double countRho = [] {
       const char *e = getenv("XO_COUNT_RHO");
@@ -3348,9 +3408,10 @@ void Xorcist::SolveBin(
   const double det = (double)s_DetectRho.load(std::memory_order_relaxed);
 
   if (det > 0.0 && order >= 2 && RhoTest(ar, ai, order, det)) {
-    // Alle Wurzeln innerhalb des Budgets: roh durchreichen.  Das ist
-    // der Normalfall - und der erste Pfad seit Bestehen der Kappung,
-    // der die Radien (= die gefitteten Huellkurven) unangetastet laesst.
+    // All roots within budget: pass the raw coefficients through
+    // unchanged. This is the normal case - and the first path since
+    // clamping existed that leaves the radii (= the fitted envelopes)
+    // untouched.
     for (unsigned k = 0; k < order; k++) {
       pCoefRe[k] = (float)ar[k];
       pCoefIm[k] = (float)ai[k];
@@ -3497,14 +3558,13 @@ void Xorcist::SolveBin(
       zi[k] -= qi;
       moved += qr * qr + qi * qi;
     }
-    // Abbruch bei Divergenz: `den < 1e-300` faengt nur den zu KLEINEN
-    // Nenner ab, nicht den ueberlaufenden.  Nach Stille und einem
-    // Einsatz ist das Polynom entartet, das Horner-Produkt laeuft nach
-    // unendlich, und die Division inf/inf liefert NaN (aufgespuert per
-    // FE_INVALID-Falle, xorcist.cpp:2763 der damaligen Zaehlung).  Ohne
-    // diesen Ausstieg rechnen 40 Iterationen auf Muell weiter und
-    // streuen ihn ueber alle Wurzeln.  Die Kappung hinter der Schleife
-    // nullt, was hier kaputtging.
+    // Divergence bail-out: `den < 1e-300` only catches a denominator that
+    // is too SMALL, not one that overflowed.  After silence followed by
+    // an onset the polynomial can be degenerate, the Horner product runs
+    // off to infinity, and inf/inf divides to NaN (caught with an
+    // FE_INVALID trap during development).  Without this exit the
+    // remaining iterations keep computing on garbage and spread it across
+    // every root.  The clamp after the loop zeroes whatever broke here.
     for (unsigned k = 0; k < order; k++)
       if (!XoFinite(zr[k]) || !XoFinite(zi[k])) {
         moved = 0.0;
@@ -3525,7 +3585,7 @@ void Xorcist::SolveBin(
       zr[k] = 0.0;
       zi[k] = 0.0;
     } else if (det > 0.0 ? (mm > det) : (mm > clampT)) {
-      // Detektor-Modus: auf rho DECKELN (Budget), klassisch: auf 1.0.
+      // Detector mode: clamp to rho (the budget); classic mode: to 1.0.
       const double tgt = det > 0.0 ? det : 1.0;
 
       zr[k] *= tgt / mm;
@@ -3593,8 +3653,8 @@ void Xorcist::ComputeChannelShadow(
   const unsigned mPow = synHop / anaHop; // rotator exponent, >= 1
   const unsigned len = nfft + anaHop;
   const float *pHist = HistWindow(ch, len);
-  // Etikett der RUNDE, nicht des Rings - siehe RoundPeriod().  Muss zum
-  // eingefrorenen Fenster passen, das HistWindow oben geliefert hat.
+  // Tag of the ROUND, not of the ring - see RoundPeriod().  Must match
+  // the frozen window HistWindow() handed back above.
   const uint64_t nowP = RoundPeriod();
   const uint64_t nowSamp = nowP * m_SamplesPerBuffer;
 
@@ -3607,8 +3667,8 @@ void Xorcist::ComputeChannelShadow(
     && AR_ORDER_MAX * arStride < m_ArRingLen + 1
     && arHop % m_SamplesPerBuffer == 0 && synHop % arHop == 0;
 
-  // ---- HYBRID: kurze 1k-Zweitkette laeuft immer warm mit ---------------
-  // Braucht Puffer, der 256 teilt, und einen groesseren Basisrahmen.
+  // ---- HYBRID: short 1k second chain always runs warm alongside -------
+  // Needs a period that divides 256, and a base frame larger than that.
   const bool hybOn = m_Hybrid.load(std::memory_order_relaxed) != 0
     && 256u % m_SamplesPerBuffer == 0 && m_SamplesPerBuffer <= 256
     && nfft > HYB_NFFT;
@@ -3655,23 +3715,23 @@ void Xorcist::ComputeChannelShadow(
         uint8_t *r4 = m_D4Rise.data() + (size_t)ch * ROUTE_BANDS;
         unsigned nR = 0;
 
-        // PEGELUNTERGRENZE (XO_D4_FLOOR, Vorgabe 0 = aus).
+        // LEVEL FLOOR (XO_D4_FLOOR, default 0 = off).
         //
-        // Das Kriterium darueber ist ein reines VERHAELTNIS: ein Band bei
-        // -120 dBFS, das sich verdoppelt, zaehlt genauso viel wie der
-        // Grundton.  Der Ring enthaelt bei hoher Lueckendichte aber zu
-        // einem guten Viertel die eigene Vorhersage, und die ist so
-        // gebaut, dass sie UNHOERBAR ist - nicht, dass sie in jedem Band
-        // pegelgleich waere.  Zwischen den Teiltoenen, wo nur Rauschgrund
-        // und Vorhersagefehler wohnen, ist Faktor zwei deshalb billig zu
-        // haben, ohne dass ein Ohr etwas davon merkt.  Genau das war die
-        // Beobachtung des Nutzers: der Detektor zuendet auf gehaltenem
-        // Klang, wo nichts zu hoeren ist.
+        // The criterion above this is a pure RATIO: a band at -120 dBFS
+        // that doubles counts exactly as much as the fundamental.  At
+        // high gap density, though, a good quarter of the ring holds this
+        // library's own prediction, and that prediction is built to be
+        // INAUDIBLE - not to match the level of every band exactly.
+        // Between the partials, where only the noise floor and prediction
+        // error live, a factor of two is therefore cheap to get without
+        // any ear noticing - which is exactly the observed symptom: the
+        // detector fires on sustained, held material where there is
+        // nothing to hear.
         //
-        // Bezug ist die MITTLERE Bandenergie des Rahmens, nicht die
-        // Spitze: skaleninvariant wie das Verhaeltnis selbst, und die
-        // Spitze waere bei einem kraeftigen Grundton so hoch, dass sie
-        // jedes echte Nebenband miterschlagen wuerde.
+        // The reference is the frame's MEAN band energy, not its peak:
+        // scale-invariant like the ratio itself, and the peak would be so
+        // high under a strong fundamental that it would swamp any real
+        // sideband.
         static const float envFloor = [] {
           const char *e = getenv("XO_D4_FLOOR");
 
@@ -3687,33 +3747,32 @@ void Xorcist::ComputeChannelShadow(
             tot += cur4[b];
           floorAbs = envFloor * (float)(tot / ROUTE_BANDS);
         }
-        // XO_D4_DEN=1 legt dieselbe Schwelle an den NENNER statt an den
-        // Zaehler: nur Baender zaehlen, die VORHER etwas getragen haben.
+        // XO_D4_DEN=1 applies the same threshold to the DENOMINATOR
+        // instead of the numerator: only count bands that carried
+        // something BEFORE the rise.
         static const bool envDen = getenv("XO_D4_DEN") != nullptr;
 
-        // BELEGTE BAENDER (XO_D4_OCC, Vorgabe 0 = aus).
+        // OCCUPIED BANDS (XO_D4_OCC, default 0 = off).
         //
-        // Das Kriterium ist ein Verhaeltnis, und in einem Band, in dem
-        // NICHTS steht, ist Faktor zwei geschenkt - dort wohnt nur der
-        // eigene Vorhersagefehler.  Solange der Kanal breitbandig ist,
-        // faellt das nicht auf; bei einem bandbegrenzten Kanal aber
-        // tragen von 257 Baendern noch drei etwas, und die restlichen
-        // 250 zuenden im Dauerlauf.  GEMESSEN am gehaltenen Ton des
-        // Nutzers bei 6000 Luecken/min: Frontpaar (86 belegte Baender)
-        // 0 Zuendungen, Tiefpass 400 Hz (5 Baender) 230, LFE-artig
-        // (3 Baender) 228.  Das Labor hat den Fehler nie gesehen, weil
-        // GOs Rekorder einen Stereo-Downmix schreibt - der Detektor in
-        // GO laeuft dagegen auf JEDEM EINZELKANAL.
+        // The criterion is a ratio, and in a band that carries NOTHING, a
+        // factor of two comes for free - only this library's own
+        // prediction error lives there.  As long as the channel is
+        // broadband this goes unnoticed; on a band-limited channel,
+        // though, only three of 257 bands carry anything, and the other
+        // 250 fire continuously.  MEASURED on a held tone at 6000
+        // gaps/min: front pair (86 occupied bands) 0 firings, 400 Hz
+        // low-pass (5 bands) 230, LFE-like (3 bands) 228.  The lab never
+        // saw this because the host's recorder writes a stereo downmix,
+        // while the detector itself runs on EVERY INDIVIDUAL CHANNEL.
         //
-        // Nur der ZAEHLER wird beschraenkt, der Nenner bleibt
-        // ROUTE_BANDS: normierte man auf die belegten Baender, waere
-        // dieselbe Zuendung im Frontpaar dreimal so breit und die
-        // Schwellen 0.25/0.12 waeren neu zu kalibrieren.  Folge des
-        // Zuschnitts: in einem Kanal mit drei belegten Baendern kann die
-        // Breite 3/256 nie die Schwelle erreichen - dort zuendet der
-        // Detektor also gar nicht mehr.  Das ist beabsichtigt; ein
-        // "breitbandiger Anstieg" ist in einem solchen Kanal kein
-        // sinnvoller Begriff.
+        // Only the NUMERATOR is restricted; the denominator stays
+        // ROUTE_BANDS.  Normalising against the occupied-band count would
+        // make the same firing three times as wide in the front pair and
+        // require recalibrating the 0.25/0.12 thresholds.  Consequence of
+        // this choice: in a channel with three occupied bands, a width of
+        // 3/256 can never reach the threshold - so the detector stops
+        // firing there entirely.  That is intentional; "broadband rise"
+        // is not a meaningful concept in such a channel.
         static const float envOcc = [] {
           const char *e = getenv("XO_D4_OCC");
 
@@ -3728,8 +3787,8 @@ void Xorcist::ComputeChannelShadow(
           if (envOcc > 0.0f)
             occAbs = envOcc * peak;
 
-          // Diagnose: wie viele Baender tragen ueberhaupt etwas?  Fest
-          // bei -60 dB unter dem lautesten Band, unabhaengig vom Regler.
+          // Diagnostic: how many bands carry anything at all?  Fixed at
+          // -60 dB below the loudest band, independent of the knob above.
           unsigned nOcc = 0;
 
           for (unsigned b = 0; b < ROUTE_BANDS; b++)
@@ -3897,7 +3956,7 @@ void Xorcist::ComputeChannelShadow(
     // A frame size change invalidates the accumulators: the recursion they
     // describe belongs to the old bin grid AND the old hop.
     if (m_ArNfft[ch] != nfft) {
-      // Planar: je Paar bzw. je k einen zusammenhaengenden Bin-Streifen.
+      // Planar: one contiguous bin strip per pair, and per k.
       for (unsigned i = 0; i < AR_PAIRS; i++) {
         const size_t o
           = (size_t)ch * AR_PAIRS * NBINS_MAX + (size_t)i * NBINS_MAX;
@@ -3971,11 +4030,11 @@ void Xorcist::ComputeChannelShadow(
       const double lam = ArLambda(P);
       const size_t pStride = (size_t)AR_ORDER_MAX * AR_ORDER_MAX * 2;
       const size_t qStride = (size_t)AR_ORDER_MAX * 2;
-      // Paar aussen, BIN innen - die innere Schleife laeuft damit
-      // zusammenhaengend ueber alle Bins (P planar, Eingangswerte im
-      // Spektrenring ohnehin planar) und ist vektorisierbar.  Nur das
-      // obere Dreieck k <= l wird gerechnet; der Rest ist die konjugierte
-      // Spiegelung und wird erst beim Auffalten in GatherBin erzeugt.
+      // Pair outer, BIN inner - the inner loop then runs contiguously
+      // over all bins (P planar, and the spectrum ring's input values are
+      // planar anyway) and vectorises.  Only the upper triangle k <= l is
+      // computed; the rest is the conjugate mirror, produced only when
+      // unfolded in GatherBin.
       const size_t pBase = (size_t)ch * AR_PAIRS * NBINS_MAX;
       const size_t qBase = (size_t)ch * AR_ORDER_MAX * NBINS_MAX;
 
@@ -4010,8 +4069,8 @@ void Xorcist::ComputeChannelShadow(
       m_ArFitPeriod[ch] = nowP;
       if (m_ArFitCount[ch] < 250)
         m_ArFitCount[ch]++;
-      // Hybrid: dieses Rasterupdate zaehlt fuer jedes junge Band als
-      // EIN echtes Tupel der langen Kette.
+      // Hybrid: this grid update counts as ONE real tuple of the long
+      // chain, for every young band.
       if (hybOn && m_HybAny[ch])
         for (unsigned b = 0; b < ROUTE_BANDS; b++) {
           const size_t o = (size_t)ch * ROUTE_BANDS + b;
@@ -4038,12 +4097,13 @@ void Xorcist::ComputeChannelShadow(
   // the 0.999/0.009 decision band.
   float sumCross = 0.0f, sumE1 = 0.0f, sumE0 = 0.0f;
   float bandE[ROUTE_BANDS] = {0.0f};
-  // Welche Baender steigen?  Der Hybrid braucht die MENGE, nicht nur die
-  // Zahl - sie ist seine Reset-Maske.
+  // Which bands are rising?  The hybrid needs the SET, not just the
+  // count - it is its reset mask.
   uint8_t riseB[ROUTE_BANDS] = {0};
-  // 1024 -> >>1, 2048 -> >>2, 4096 -> >>3, 8192 -> >>4: 256 Baender
-  // ueber Nyquist.  Der 1k-Fall FEHLTE beim Einbau des Modus - 1k lief
-  // mit >>4 auf 32 Baendern, Detektor und Router entsprechend vergroebert.
+  // 1024 -> >>1, 2048 -> >>2, 4096 -> >>3, 8192 -> >>4: 256 bands across
+  // Nyquist.  The 1k case was MISSING when this mode was first wired up -
+  // 1k ran with >>4, i.e. 32 bands, coarsening both detector and router
+  // accordingly.
   const unsigned bandShift = nfft == 1024
     ? 1u : (nfft == 2048 ? 2u : (nfft == 4096 ? 3u : 4u));
 
@@ -4181,28 +4241,27 @@ void Xorcist::ComputeChannelShadow(
         c += u * v;
         e1 += u * u;
         e0 += v * v;
-        // positiver Spektralfluss fuer den Transienten-Trigger: ein
-        // zuschaltendes Register hebt Baender von fast null an - relativ
-        // ein Riesensprung, egal wie laut der Rest schon ist.  sim bei
-        // Hop 128 sieht das nicht: die Registerzuschaltungen tauchten
-        // auf 0.9991 ein, waehrend gehaltenes Material auf 0.9971
-        // schwankt.
+        // Positive spectral flux for the transient trigger: a stop
+        // engaging lifts bands from near-zero - a huge relative jump no
+        // matter how loud everything else already is.  sim at hop 128
+        // does not see this: stop engagements showed up at 0.9991, while
+        // sustained material already fluctuates down to 0.9971.
         if (u > v)
           posF += u - v;
         totF += v;
-        // BREITE statt Energie: wie viele Baender steigen um mehr als
-        // 6 dB?  Ein Anschlag zuendet viele Baender gleichzeitig, auch
-        // solche am Rauschgrund - und zwar unabhaengig davon, wie laut
-        // es schon war, also auch bei Einsaetzen MITTEN in den Klang.
-        // Periodische AMPLITUDENMODULATION - auf dem Kalibriermaterial
-        // eine ~9-Hz-Schwebung verstimmter Choere, mit gezogenem
-        // Tremulant dieselbe Signatur - hebt dagegen periodisch
-        // DIESELBEN Baender: gemessen p99 Breite 0.113 gegen 0.31-0.87
-        // bei echten Einsaetzen, waehrend der ENERGIEfluss bei der
-        // Modulation mit 0.466 hoeher lag als bei jedem Einsatz.  Weil
-        // Schwebung Grundzustand von Orgelklang ist (nicht nur ein
-        // Registrier-Sonderfall), ist diese Trennung Pflicht, nicht
-        // Feinschliff.  (Einordnung vom Nutzer, 07.08.)
+        // WIDTH rather than energy: how many bands rise by more than
+        // 6 dB?  An onset fires many bands at once, including ones
+        // sitting at the noise floor - and it does so regardless of how
+        // loud the signal already was, so it also catches onsets landing
+        // IN THE MIDDLE of an already-sounding chord.  Periodic AMPLITUDE
+        // MODULATION, by contrast - a ~9 Hz beat between detuned choirs
+        // on the calibration material, and a drawn tremulant has the same
+        // signature - lifts the SAME bands periodically: measured p99
+        // width 0.113 against 0.31-0.87 for real onsets, while the
+        // ENERGY flux during the modulation sat at 0.466, higher than for
+        // any onset.  Because beating is the baseline state of organ
+        // sound (not just a special registration case), this separation
+        // is mandatory, not polish.
         if (u > 2.0 * v) {
           nRise++;
           riseB[i] = 1;
@@ -4224,7 +4283,7 @@ void Xorcist::ComputeChannelShadow(
     onsetWide = usable ? (double)nRise / ROUTE_BANDS : -1.0;
   }
 
-  // Kalibrierhilfe (XO_SIM_TRACE=<pfad>): Periode, sim, Fluss.
+  // Calibration aid (XO_SIM_TRACE=<path>): period, sim, flux.
   {
     static FILE *simTrace = [] {
       const char *e = getenv("XO_SIM_TRACE");
@@ -4233,9 +4292,9 @@ void Xorcist::ComputeChannelShadow(
     }();
 
     if (simTrace && ch == 0) {
-      // Spalten 5-7: Residuen-Statistik der beiden Ketten (nur mit
-      // hybrid+chooser gefuellt, sonst 0) - fuer die Frage des Nutzers,
-      // ob der VORHERSAGEFEHLER als Detektor trennt.
+      // Columns 5-7: residual statistics of the two chains (populated
+      // only with hybrid+chooser, otherwise 0) - for checking whether the
+      // PREDICTION ERROR itself separates as a detector.
       const float *ra = m_HybResA.data();
       const float *rb = m_HybResB.data();
       double ma = 0.0, xa = 0.0, mb = 0.0;
@@ -4253,10 +4312,10 @@ void Xorcist::ComputeChannelShadow(
     }
   }
 
-  // ---- HYBRID: 512er-Vorstufe ------------------------------------------
-  // Jede Periode: 512er-Rahmen, 94-Hz-Baender (1 Bin = 1 Band), Breite
-  // gegen 8 Perioden zurueck.  Kreuzt sie die Vor-Schwelle, schalten
-  // die steigenden Baender VORLAEUFIG auf die kurze Kette.
+  // ---- HYBRID: 512-sample pre-stage ------------------------------------
+  // Every period: a 512-sample frame, 94 Hz bands (1 bin = 1 band), width
+  // compared 8 periods back.  If it crosses the pre-threshold, the rising
+  // bands switch PROVISIONALLY onto the short chain.
   if (
     hybOn && m_HybPre.load(std::memory_order_relaxed)
     && !m_HybChooser.load(std::memory_order_relaxed)
@@ -4275,7 +4334,7 @@ void Xorcist::ComputeChannelShadow(
       + ((size_t)ch * PRE_RING + sl) * ROUTE_BANDS;
 
     for (unsigned b = 0; b < ROUTE_BANDS; b++) {
-      const float re = pF[b + 1][0], im = pF[b + 1][1]; // DC ueberspringen
+      const float re = pF[b + 1][0], im = pF[b + 1][1]; // skip DC
 
       cur[b] = re * re + im * im;
     }
@@ -4286,11 +4345,11 @@ void Xorcist::ComputeChannelShadow(
     if (
       nowP >= 8 && m_PrePeriod[(size_t)ch * PRE_RING + s8] == nowP - 8
       && (RoundMask() & ((1u << (preVeto() + 1)) - 1u)) == 0) {
-      // Vorstufen-Veto LAENGER als beim 2k-Detektor (Vorgabe 5 statt 2
-      // Perioden): das 512er-Fenster traegt den Wiedereinstiegs-Spleiss
-      // 4 Perioden lang mit hohem Gewicht, und bei dichter Verdeckung
-      // zuendete die Vorstufe sonst dauernd auf Residuen (Schwebung
-      // -4.5 -> +0.9 dB NMR bei 6000/min mit Veto 2).
+      // Pre-stage veto LONGER than the 2k detector's (default 5 rather
+      // than 2 periods): the 512-sample window carries the re-entry seam
+      // at high weight for 4 periods, and under dense concealment the
+      // pre-stage would otherwise fire constantly on residuals (beating
+      // went -4.5 -> +0.9 dB NMR at 6000/min with a veto of 2).
       const float *old8 = m_PreBandE.data()
         + ((size_t)ch * PRE_RING + s8) * ROUTE_BANDS;
       uint8_t rise512[ROUTE_BANDS];
@@ -4301,9 +4360,9 @@ void Xorcist::ComputeChannelShadow(
         nR += rise512[b];
       }
 
-      // Kalibriert 08.08. (sauberer Lauf, 128er-Perioden): Stoermax
-      // 0.401 (gehalten), Einsatz-Minimum 0.424 - hauchduenn, deshalb
-      // nur VORLAEUFIG plus Rueckzug.
+      // Calibrated on a clean run, 128-sample periods: noise maximum
+      // 0.401 (held tone), onset minimum 0.424 - razor-thin, which is
+      // why this fires only PROVISIONALLY, with a withdrawal path.
       static const float PRE_ON = [] {
         const char *e = getenv("XO_PRE_ON");
 
@@ -4318,28 +4377,29 @@ void Xorcist::ComputeChannelShadow(
       static const float PRE_OFF = [] {
         const char *e = getenv("XO_PRE_OFF");
 
-        // 0.38, knapp unter ON: bei 26.7 % Verdeckung heben die
-        // Residuen die Breite dauerhaft ueber die alte 0.32 - Kandidaten
-        // beruhigten sich NIE, hingen 256 ms auf Residuen fest, und
-        // echte Einsaetze dahinter verhungerten ('zweiter Einsatz
-        // notorisch zu spaet, ohne Grund' - exakt der Stau).
+        // 0.38, just below ON: at 26.7% concealment density the
+        // residuals keep the width permanently above the old 0.32 -
+        // candidates NEVER settled, stayed stuck on residuals for
+        // 256 ms, and real onsets queued up behind them starved
+        // (observed as "second onset notoriously late for no reason" -
+        // exactly this backlog).
         return e ? (float)atof(e) : 0.38f;
       }();
       const float wideNow = (float)nR / ROUTE_BANDS;
 
-      // Kandidaten-Verfall: 48 Perioden (128 ms) - laenger dauert kein
-      // Anschlagskern, und im Residuen-Nebel darf kein Kandidat die
-      // Buehne blockieren.
+      // Candidate expiry: 48 periods (128 ms) - no onset core takes
+      // longer than that, and in the residual haze no candidate may be
+      // allowed to block the stage indefinitely.
       if (
         m_PreCandP[ch] != ~0ull && nowP - m_PreCandP[ch] > 48)
         m_PreCandP[ch] = ~0ull;
 
-      // LAUTSTAERKE-TOR (Nutzer 08.08.): die Transienten der Stille
-      // (Motor, Residuen) sind ECHT, aber nicht massgeblich hoerbar -
-      // sie verbrauchen Kandidaten, hinter denen echte Einsaetze
-      // anstehen.  Gezuendet wird nur ueber XO_PRE_LOUD (-20 dB) des
-      // laufenden Maximums (Zerfall ~2.7 s): nach Stille darf leise
-      // zuenden, neben lautem Klang nur Lautes.
+      // VOLUME GATE: the transients found during silence (blower motor,
+      // residuals) are REAL but not meaningfully audible - they consume
+      // candidates that real onsets then have to queue behind.  Firing
+      // is only permitted above XO_PRE_LOUD (-20 dB) of the running
+      // maximum (decay ~2.7 s): after silence, a quiet onset may fire;
+      // next to loud material, only loud onsets may.
       static const float PRE_LOUD = [] {
         const char *e = getenv("XO_PRE_LOUD");
 
@@ -4356,7 +4416,7 @@ void Xorcist::ComputeChannelShadow(
       if (wideNow >= PRE_ON && loud) {
         m_PreStable[ch] = 0;
         if (m_PreCandP[ch] == ~0ull) {
-          // ZUENDUNG - das eine Ereignis dieses Anschlags.
+          // FIRE - the single event representing this onset.
           m_PreCandP[ch] = nowP;
           HybridOnset(ch, rise512, nbins, bandShift, true);
           m_PreChk[ch] = (uint8_t)PRE_CHK;
@@ -4368,21 +4428,21 @@ void Xorcist::ComputeChannelShadow(
           std::copy_n(rise512, ROUTE_BANDS,
                       m_PreRise.begin() + (size_t)ch * ROUTE_BANDS);
         } else
-          // Anschlag entfaltet sich: neue steigende Baender treten bei.
+          // The onset is still unfolding: newly rising bands join in.
           HybridOnset(ch, rise512, nbins, bandShift, true);
       } else if (m_PreCandP[ch] != ~0ull && wideNow < PRE_OFF) {
         if (++m_PreStable[ch] >= 4) {
-          m_PreCandP[ch] = ~0ull; // beruhigt - bereit fuer den naechsten
+          m_PreCandP[ch] = ~0ull; // settled - ready for the next one
           m_PreStable[ch] = 0;
         }
       } else
         m_PreStable[ch] = 0;
     }
 
-    // Waehrend der Check laeuft: Maximum des mittleren
-    // A-Vorhersagefehlers mitfuehren.  Der EMA-Momentanwert AM
-    // Checkpunkt verpasste den schwaechsten Einsatz (7,26 s), dessen
-    // Residuum erst um die Checkzeit kreuzt.
+    // While the check is running: track the maximum of the mean A-chain
+    // prediction error.  The EMA's instantaneous value AT the check point
+    // missed the weakest onset in the calibration run, whose residual
+    // only crosses the threshold right around that check time.
     if (m_PreChk[ch]) {
       const float *ra = m_HybResA.data() + (size_t)ch * ROUTE_BANDS;
       float *rb = m_PreResMaxB.data() + (size_t)ch * ROUTE_BANDS;
@@ -4398,8 +4458,8 @@ void Xorcist::ComputeChannelShadow(
         m_PreResMax[ch] = (float)m;
     }
 
-    // PERSISTENZ-CHECK: laeuft unabhaengig vom Veto (er vergleicht nur
-    // eingefrorene Vergangenheit mit dem aktuellen Rahmen).
+    // PERSISTENCE CHECK: runs independently of the veto above (it only
+    // compares a frozen past snapshot against the current frame).
     if (m_PreChk[ch] && --m_PreChk[ch] == 0) {
       const float *base = m_PreBase.data() + (size_t)ch * ROUTE_BANDS;
       const uint8_t *orig = m_PreRise.data() + (size_t)ch * ROUTE_BANDS;
@@ -4417,31 +4477,30 @@ void Xorcist::ComputeChannelShadow(
 
         return e ? (float)atof(e) : 0.5f;
       }();
-      // ZWEITES, UNABHAENGIGES Urteil: der mittlere Vorhersagefehler
-      // der LANGEN Kette.  Langsame Schwellungen sind fuer das
-      // AR-Modell vorhersagbar (sie BESTEHEN die Band-Persistenz,
-      // resA bleibt unten), ein neuer phasenkohaerenter Ton nicht
-      // (Nutzer-These, kalibriert: Stoermax 0.0258, Einsatz-Min
-      // 0.0279, Latenz 16-35 ms = zur Checkzeit gekreuzt).  Zwei
-      // 1.06er-Margen, UND-verknuepft.
+      // SECOND, INDEPENDENT judgment: the LONG chain's mean prediction
+      // error.  Slow swells are predictable for the AR model (they PASS
+      // the band-persistence test, resA stays low), a new, phase-
+      // coherent tone is not (calibrated: noise maximum 0.0258, onset
+      // minimum 0.0279, latency 16-35 ms = crosses right around the
+      // check time).  Two margins of ~1.06x, AND-combined.
       static const float PRE_RES = [] {
         const char *e = getenv("XO_PRE_RES");
 
         return e ? (float)atof(e) : 0.027f;
       }();
-      // PER-BAND-Urteil (Nutzer-Go 08.08.): ein Band bleibt nur, wenn
-      // es SELBST persistent gestiegen ist UND sein EIGENES Residuum
-      // seit der Zuendung gesprungen ist (unvorhersagbar).  Schwebungs-
-      // und Schwellungsbaender sind persistent, aber vorhersagbar -
-      // sie fliegen einzeln raus, waehrend die Anschlagsbaender
-      // bleiben.  Das Kanalmittel scheiterte, weil an den
-      // Zuendmomenten alle Kanal-Kriterien korrelieren.
+      // PER-BAND judgment: a band is kept only if it ITSELF rose
+      // persistently AND its OWN residual jumped since it fired
+      // (unpredictable).  Beating and swell bands are persistent but
+      // predictable - they get thrown out individually while the real
+      // onset bands remain.  A channel-wide average failed here because
+      // at the moment of firing, all channel-level criteria correlate.
       static const float PRE_RESB = [] {
         const char *e = getenv("XO_PRE_RESB");
 
-        // 0.10 gewann den Sweep: Schwebung bei jeder Schwelle sauber,
-        // Motor fast weg, und bei 6000/min bester Schlimmstfall (7.70)
-        // und beste Einsatz-Luecken (+0.90) der ganzen Messreihe.
+        // 0.10 won the sweep: beating stayed clean at every threshold,
+        // the blower motor nearly disappeared, and at 6000/min this gave
+        // both the best worst-case (7.70) and the best onset-gap score
+        // (+0.90) of the whole measurement series.
         return e ? (float)atof(e) : 0.10f;
       }();
       const float *rbMax = m_PreResMaxB.data() + (size_t)ch * ROUTE_BANDS;
@@ -4473,12 +4532,13 @@ void Xorcist::ComputeChannelShadow(
     }
   }
 
-  // ---- HYBRID: A-Residuum fuer den Waehler -----------------------------
-  // Wie gut haetten die aktuellen A-Koeffizienten diesen Rahmen aus den
-  // Ring-Lags vorhergesagt?  Relative Fehler, per Band, EMA ~3 Perioden.
-  // Auch fuer den Simpel-Detektor: er braucht das Residuum als
-  // Trennkriterium (siehe Zuendstelle weiter unten).  Vorher lief der
-  // Rechner nur fuer Waehler und Vorstufe - beide in GO aus.
+  // ---- HYBRID: A-chain residual for the chooser ------------------------
+  // How well would the current A coefficients have predicted this frame
+  // from the ring lags?  Relative error, per band, EMA over ~3 periods.
+  // Also used by the simple detector: it needs this residual as its
+  // separating criterion (see the firing site further below).  Before
+  // this, the computation only ran for the chooser and the pre-stage -
+  // both disabled in the host application.
   if (hybOn
       && (m_HybChooser.load(std::memory_order_relaxed)
           || m_HybPre.load(std::memory_order_relaxed)
@@ -4540,17 +4600,17 @@ void Xorcist::ComputeChannelShadow(
     }
   }
 
-  // ---- Transienten-Patch: Fluss-Trigger --------------------------------
-  // Einsatz, wenn der positive Bandfluss ueber die 8-Perioden-Baseline
-  // springt; stabilisiert, wenn er STABLE_K Perioden am Stueck wieder
-  // unten liegt.  Waechter wie gehabt: saubere letzte 16 Perioden,
-  // Entprellung, Reichweitenpruefung in BuildBackPatch.
-  // Der Detektor laeuft IMMER (Kosten: eine Handvoll Vergleiche) und
-  // meldet jeden stabilisierten Einsatz ins Ereignisprotokoll - das Lab
-  // zeigt ihn als Linie, auch wenn nicht gepatcht wird.  Nur der
-  // PATCH-Bau haengt am Modus und seinen Waechtern.
-  // Simpel-Modus: Erkennung durch die 4k-Augen, mit 4k-Schwellen und
-  // 4k-Rise-Menge - unabhaengig vom Verdeckungsrahmen.
+  // ---- Transient patch: flux trigger -----------------------------------
+  // Onset when the positive band flux jumps above the 8-period baseline;
+  // stabilised once it has stayed below the threshold for STABLE_K
+  // periods in a row.  Guards as before: a clean last 16 periods,
+  // debouncing, reach check in BuildBackPatch.
+  // The detector ALWAYS runs (cost: a handful of comparisons) and logs
+  // every stabilised onset to the event log - the lab tool shows it as a
+  // marker line even when no patch is actually built.  Only the PATCH
+  // construction itself depends on the mode and its guards.
+  // Simple mode: detection via the 4k "eyes", with 4k thresholds and the
+  // 4k rise count - independent of the concealment frame.
   const bool detSimple
     = hybSimple && m_D4Wide[ch] >= 0.0f;
   const double detWide = detSimple ? (double)m_D4Wide[ch] : onsetWide;
@@ -4559,14 +4619,14 @@ void Xorcist::ComputeChannelShadow(
     = detSimple ? m_D4Rise.data() + (size_t)ch * ROUTE_BANDS : riseB;
 
   if (detWide >= 0.0) {
-    // RAHMENABHAENGIG: die Breite haengt an der Mittelungslaenge des
-    // Analyse-Fensters.  4k (85 ms) kalibriert am 07.08.: gehalten p99
-    // 0.217, Schwebung p99 0.113, Einsaetze 0.31-0.87 -> ON 0.25.
-    // 2k (43 ms) mittelt halb so lang, alles zappelt hoeher: gehalten
-    // p99 0.268/max 0.328, Schwebung p99 0.258, Einsaetze 0.363-0.887
-    // -> ON 0.33.  Mit den 4k-Schwellen auf 2k feuerte der Detektor 48x
-    // gleichverteilt ueber die Datei.  1k ist NICHT kalibriert
-    // (konservativ hoch geraten).
+    // FRAME-SIZE DEPENDENT: the width depends on the analysis window's
+    // averaging length.  4k (85 ms), calibrated: held tone p99 0.217,
+    // beating p99 0.113, onsets 0.31-0.87 -> ON 0.25.  2k (43 ms) averages
+    // over half the time, so everything jitters higher: held tone p99
+    // 0.268/max 0.328, beating p99 0.258, onsets 0.363-0.887 -> ON 0.33.
+    // Running the 4k thresholds on 2k made the detector fire 48 times,
+    // spread evenly across the file.  1k is NOT calibrated (guessed
+    // conservatively high).
     static const double envOn = [] {
       const char *e = getenv("XO_WIDE_ON");
 
@@ -4575,11 +4635,12 @@ void Xorcist::ComputeChannelShadow(
     const double FLUX_ON = envOn > 0.0
       ? envOn
       : (detNfft <= 1024 ? 0.40 : (detNfft <= 2048 ? 0.33 : 0.25));
-    // Beruhigung ZWISCHEN Ruhelage-p95 (0.058) und schwaechstem Einsatz
-    // (0.121) - die erste Fassung lag mit ON*0.4 = 0.04 UNTER dem
-    // Ruhelage-Median: sechs Perioden am Stueck darunter waren ein
-    // Wuerfelspiel, drei von fuenf Einsaetzen wurden nie gepatcht und
-    // verwaiste Kandidaten feuerten hunderte Millisekunden spaeter.
+    // Settle threshold BETWEEN the resting-state p95 (0.058) and the
+    // weakest onset (0.121) - an earlier version used ON*0.4 = 0.04,
+    // which sat BELOW the resting-state median: six periods in a row
+    // below that was a coin flip, three of five onsets were never
+    // patched, and orphaned candidates fired hundreds of milliseconds
+    // later.
     static const double envOff = [] {
       const char *e = getenv("XO_WIDE_OFF");
 
@@ -4589,69 +4650,72 @@ void Xorcist::ComputeChannelShadow(
       ? envOff
       : (detNfft <= 1024 ? 0.22 : (detNfft <= 2048 ? 0.15 : 0.12));
     static constexpr unsigned STABLE_K = 6;
-    // Zweite Verteidigungslinie WIEDERHOLRATE: die 9-Hz-Schwebung
-    // feuert im 110-ms-Takt, echte Zuschaltungen liegen Sekunden
-    // auseinander.  0.5 s Entprellung laesst jeden echten Einsatz durch.
-    // Die alten 4096 Samples (85 ms) lagen knapp UNTER der
-    // Modulationsperiode - der denkbar schlechteste Wert.
+    // Second line of defence, REPETITION RATE: the 9 Hz beating fires on
+    // a 110 ms cadence, while real stop engagements are seconds apart.
+    // A 0.5 s debounce window lets every real onset through.  The old
+    // value of 4096 samples (85 ms) sat just BELOW the modulation
+    // period - about the worst possible choice.
     static const uint64_t DEBOUNCE = [] {
       const char *e = getenv("XO_PATCH_DEBOUNCE");
 
       return e ? (uint64_t)atoll(e) : 24000ull;
     }();
-    // Verfallsdatum: wer sich binnen 48 Perioden (~128 ms) nicht
-    // beruhigt, ist keine Zuschaltung, sondern laufende Bewegung -
-    // dort ist KEIN Patch die richtige Antwort.
-    static constexpr uint64_t CANDIDATE_TTL = 96; // 256 ms Wiederhol-Raum
+    // Expiry: a candidate that has not settled within 48 periods
+    // (~128 ms) is not a stop engagement but ongoing motion - there, NO
+    // patch is the right answer.
+    static constexpr uint64_t CANDIDATE_TTL = 96; // 256 ms repeat window
 
-    // RUHE DAVOR ist der Tremulant-Diskriminator, nicht die Hoehe: der
-    // Tremulant erreicht 0.345 Fluss, echte Zuschaltungen nur 0.12-0.27
-    // - ueber die Amplitude sind sie NICHT trennbar.  Ueber die
-    // Struktur schon: gemessen auf dem D-Dur-Material ist die laengste
-    // ruhige Straehne vor echten Einsaetzen ueber 1200 ms, im
-    // Tremulant-Abschnitt 35 ms.  QUIET_BEFORE = 96 Perioden (256 ms)
-    // trennt mit Faktor 7 Sicherheitsabstand.
+    // "Quiet before" was tried as a tremulant discriminator instead of
+    // flux height: the tremulant reaches a flux of 0.345, real stop
+    // engagements only 0.12-0.27 - amplitude alone does NOT separate
+    // them.  Structure does: on the calibration material, the longest
+    // quiet stretch before a real onset is over 1200 ms, versus 35 ms in
+    // the tremulant section.  QUIET_BEFORE = 96 periods (256 ms)
+    // separates them with a 7x safety margin.
     //
-    // Die erste Fassung eichte ausgerechnet AUF dem Tremulant-Abschnitt
-    // und nannte ihn "gehalten" - 44 der 58 Ereignisse waren dann seine
-    // 9-Hz-Modulation im 110-ms-Takt, und die 85-ms-Entprellung lag
-    // knapp unter seiner Periode.
-    // GEMESSEN UND VERWORFEN: die Ruhe vor dem Sprung trennt NICHT -
-    // sie trennt falsch herum.  Vor echten Zuschaltungen liegen 1 bis 9
-    // ruhige Perioden (3-24 ms), vor Schwebungs-Spitzen median 11 und
-    // bis 13.  Der Waechter haette also die Modulation bevorzugt.
-    // Bleibt als Knopf (Vorgabe 0 = aus), fuer die Reproduzierbarkeit.
+    // The first version of this calibration, however, was run against
+    // precisely the tremulant section and mislabelled it "held tone" -
+    // 44 of its 58 events then turned out to be the 9 Hz modulation at
+    // its 110 ms cadence, and the 85 ms debounce window sat just below
+    // that period.
+    // MEASURED AND REJECTED after correcting that: the quiet period
+    // before the jump does NOT separate the two cases - it separates
+    // them the wrong way round.  Real stop engagements have 1 to 9 quiet
+    // periods before them (3-24 ms), beating peaks have a median of 11
+    // and up to 13.  This guard would therefore have favoured the
+    // modulation.  It remains available as a switch (default 0 = off),
+    // for reproducibility.
     static const unsigned QUIET_BEFORE = [] {
       const char *e = getenv("XO_QUIET_BEFORE");
 
       return e ? (unsigned)atoi(e) : 0u;
     }();
 
-    // SPLEISS-VETO.  Der Detektor sieht nie Luecken - der Ring haelt
-    // seit dem Fade-im-Ring nur aufbereitetes Material.  Was ihn
-    // taeuscht, ist der WIEDEREINSTIEG: der in der Vorhersage
-    // kollabierte Rauschgrund springt beim Spleiss breitbandig zurueck,
-    // und das ist formal derselbe Puls wie ein Anschlag.  Gemessen am
-    // D-Dur-Material bei 6000 Luecken/min (Breite im Schwebungs-
-    // Abschnitt, nach Abstand zum Wiedereinstieg):
+    // SPLICE VETO.  The detector never sees actual gaps - since the
+    // history ring started holding faded-in material, it only ever sees
+    // processed signal.  What fools it instead is the RE-ENTRY: the
+    // noise floor, which had collapsed inside the prediction, jumps back
+    // broadband at the splice point, and formally that is the same
+    // pulse shape as an onset.  Measured at 6000 gaps/min (width during
+    // the beating section, by distance from the re-entry point):
     //
-    //   0-1 Perioden   p99 0.198   max 0.262   2x ueber ON
-    //   2-3 Perioden   p99 0.173   max 0.215   nie ueber ON
-    //   >=4 Perioden   p99 0.133   max 0.172   = sauberer Lauf
+    //   0-1 periods   p99 0.198   max 0.262   2x above ON
+    //   2-3 periods   p99 0.173   max 0.215   never above ON
+    //   >=4 periods   p99 0.133   max 0.172   = clean run
     //
-    // Alle vier Falschzuendungen sassen 1-2 Perioden hinter einem
-    // Wiedereinstieg.  Zwei Perioden Sperre genuegen also; das Veto ist
-    // reine Rueckschau auf die Vorhersagemaske, also vollstaendig
-    // kausal und in GO genauso zu haben.
+    // All four false firings sat 1-2 periods behind a re-entry point.
+    // A two-period lockout is therefore enough; the veto is pure
+    // hindsight on the prediction mask, so it is fully causal and
+    // equally available in the host application.
     static const unsigned SPLICE_VETO = [] {
       const char *e = getenv("XO_SPLICE_VETO");
 
       return e ? (unsigned)atoi(e) : 2u;
     }();
     const uint32_t mask = RoundMask();
-    // Bit 0 = diese Periode, Bit 1 = die vorige: waehrend der Analyse
-    // echter Audiodaten ist Bit 0 stets frei, Bit 1 markiert genau die
-    // Wiedereinstiegsperiode.
+    // Bit 0 = this period, bit 1 = the previous one: while analysing real
+    // audio data bit 0 is always clear, and bit 1 marks exactly the
+    // re-entry period.
     const uint32_t vetoMask = (SPLICE_VETO >= 31)
       ? ~0u
       : ((1u << (SPLICE_VETO + 1)) - 1u);
@@ -4681,14 +4745,14 @@ void Xorcist::ComputeChannelShadow(
       m_StableCount[ch] = 0;
     }
     if (detWide > FLUX_ON) {
-      // ZUENDUNG = Erkennung.  Gemeldet wird JETZT, nicht nach der
-      // Beruhigung: alles, was frueher zwischen Zuendung und Meldung
-      // lag (Beruhigung, Verfallsdatum, Entprellung), war Geruest fuer
-      // den RUECKWAERTS-Patch - der musste warten, bis der Transient
-      // vorbei war.  Ein Modellwechsel dagegen muss im Moment des
-      // Anschlags greifen, und ein nachtraegliches Verwerfen des
-      // Kandidaten waere in GO ohnehin unmoeglich (Nutzer, 07.08.).
-      // Das Geruest bleibt nur noch fuer den Patch-Zweig stehen.
+      // FIRING = detection.  Reported NOW, not after settling: everything
+      // that used to sit between firing and reporting (settle time,
+      // expiry, debounce) was scaffolding for the BACKWARD patch, which
+      // had to wait until the transient was over.  A model switch, by
+      // contrast, must take effect at the moment of the onset itself,
+      // and discarding the candidate after the fact would be impossible
+      // in the host application anyway.  That scaffolding now only
+      // remains in place for the patch branch.
       if (
         m_OnsetPeriod[ch] == ~0ull && m_QuietRun[ch] >= QUIET_BEFORE
         && (mask & vetoMask) == 0) {
@@ -4697,68 +4761,69 @@ void Xorcist::ComputeChannelShadow(
           const uint64_t n = s_PatchLogN.load(std::memory_order_relaxed);
           uint64_t *e = s_PatchLog[n % PATCH_LOG];
 
-          // Zone/Laenge 0 heisst "erkannt, nicht gepatcht"; ein
-          // spaeterer Patch meldet denselben Einsatz mit Zone nach.
+          // Zone/length 0 means "detected, not patched"; a later patch
+          // reports the same onset with the zone filled in.
           e[0] = nowP * m_SamplesPerBuffer;
           e[1] = 0;
           e[2] = 0;
           s_PatchLogN.store(n + 1, std::memory_order_relaxed);
         }
       }
-      // HYBRID: Baender wechseln nur mit LEBENDEM Kandidaten - also
-      // unter genau den Bedingungen (Veto, Verfallsdatum), unter denen
-      // die Maschinerie einen Einsatz von Spleiss-Residuen und
-      // laufender Bewegung trennt.  Die erste Fassung hing nur am Veto:
-      // jeder Breiten-Ausreisser in lauten Abschnitten schaltete
-      // Baender mitten im Plateau auf die kurze Kette (Rest-Luecken
-      // -2.55 -> -0.66).  Solange der Puls anhaelt, treten weitere
-      // steigende Baender bei (der Anschlag entfaltet sich).
-      // Eigene Latte fuer den KETTENWECHSEL: 0.28 trennt die echten
-      // Einsaetze (schwaechster 0.297) von Doppelzuendungen und dem
-      // Schwebungs-Ausreisser (0.262-0.273).  Beim Patch war eine
-      // Falschzuendung ein no-op - hier kostet sie 50-80 ms kurze Kette
-      // im Plateau, wo die 8.5 dB verliert (Schwebung -6.7 vs +1.8).
+      // HYBRID: bands switch only with a LIVE candidate - i.e. under
+      // exactly the conditions (veto, expiry) under which the machinery
+      // separates a real onset from splice residuals and ongoing motion.
+      // An earlier version depended only on the veto: every width
+      // outlier in loud passages switched bands onto the short chain in
+      // the middle of a plateau (residual gaps went -2.55 -> -0.66).  As
+      // long as the pulse continues, further rising bands join in (the
+      // onset is still unfolding).
+      // Separate threshold for the CHAIN SWITCH itself: 0.28 separates
+      // real onsets (weakest 0.297) from double-firings and the beating
+      // outlier (0.262-0.273).  For the patch branch a false firing was a
+      // no-op; here it costs 50-80 ms of short chain inside a plateau,
+      // where that costs 8.5 dB (beating -6.7 vs +1.8).
       static const double envHyb = [] {
         const char *e = getenv("XO_HYB_WIDE");
 
         return e ? atof(e) : 0.0;
       }();
-      // Simpel: geschaltet wird AN der Erkennungsschwelle - die
-      // separate (hoehere) Schaltlatte gab es damals nicht, und sie
-      // kostete die zwei leisen Einsaetze (Spitzen 0.26-0.31 bei 4k).
+      // Simple mode: switches right AT the detection threshold - the
+      // separate (higher) switch threshold did not exist in that mode
+      // yet, and it would have cost the two quiet onsets (peaks
+      // 0.26-0.31 at 4k).
       const double HYB_WIDE = envHyb > 0.0
         ? envHyb
         : (detSimple ? FLUX_ON : (detNfft <= 2048 ? 0.34 : 0.28));
 
-      // Der Wechselwunsch haengt NICHT am Kandidaten: beim
-      // schwaechsten Einsatz (7,30 s @ 6000/min) blockierte das Veto
-      // alle starken Perioden - dann entsteht auch nie ein Kandidat,
-      // und ein kandidatengebundener Wunsch verhungerte mit.  Die
-      // Schaltlatte 0.34 ist ohnehin die schaerfere Huerde.
-      // ---- RESIDUEN-TOR (XO_D4_RES, Vorgabe 0 = aus) ----------------
-      // Die Breite allein kann Schwebung und Ausklang nicht von einem
-      // Anschlag trennen: beide heben Bandenergien an, und in den leisen
-      // Baendern, wo der eigene Vorhersagefehler wohnt, ist Faktor zwei
-      // billig.  Eine PEGEL-Untergrenze scheitert daran, dass echte
-      // Anschlagsbaender im selben Bereich liegen (gemessen: schon
-      // 0,001 der mittleren Bandenergie loescht alle sechs Einsaetze).
+      // The switch request does NOT depend on a candidate existing: for
+      // the weakest onset in the calibration run, the veto blocked every
+      // strong period, so no candidate ever formed, and a
+      // candidate-bound switch request would have starved along with
+      // it.  The 0.34 switch threshold is the sharper hurdle anyway.
+      // ---- RESIDUAL GATE (XO_D4_RES, default 0 = off) ----------------
+      // Width alone cannot separate beating or decay from a real onset:
+      // both raise band energies, and in the quiet bands - where only
+      // this library's own prediction error lives - a factor of two is
+      // cheap.  A LEVEL floor fails because real onset bands sit in the
+      // same range (measured: even 0.001 of the mean band energy erases
+      // all six calibration onsets).
       //
-      // Was trennt, ist die VORHERSAGBARKEIT: eine Schwebung setzt die
-      // lange Kette fort, ein Anschlag nicht.  m_HybResA traegt genau
-      // das je Band - den relativen Vorhersagefehler der A-Koeffizienten
-      // auf diesen Rahmen.  Ein Band zaehlt also nur, wenn es steigt UND
-      // sein eigenes Residuum gesprungen ist; die Breite wird aus den so
-      // bestaetigten Baendern neu gebildet.  Derselbe Gedanke wie beim
-      // Per-Band-Urteil der 512er-Vorstufe, dort gemessen mit
-      // "Schwebung 0 bestaetigte Baender bei jeder Schwelle".
+      // What separates them is PREDICTABILITY: beating continues the
+      // long chain, an onset does not.  m_HybResA carries exactly that
+      // per band - the A coefficients' relative prediction error on this
+      // frame.  So a band counts only if it is rising AND its own
+      // residual has jumped; the width is then rebuilt from only the
+      // bands confirmed that way.  Same idea as the per-band judgment in
+      // the 512-sample pre-stage, measured there as "beating confirms
+      // zero bands at any threshold".
       const float D4_RES = m_D4ResGate.load(std::memory_order_relaxed);
       const uint8_t *fireRise = detRise;
       double fireWide = detWide;
 
       if (D4_RES > 0.0f && detSimple) {
-        // Abklingrate: 0.85 je Periode haelt das Maximum rund acht
-        // Perioden lang oben (0.85^8 = 0.27) - dieselbe Groessenordnung
-        // wie das Prueffenster der Vorstufe.
+        // Decay rate: 0.85 per period keeps the maximum elevated for
+        // roughly eight periods (0.85^8 = 0.27) - the same order of
+        // magnitude as the pre-stage's check window.
         const float D4_DECAY = m_D4ResDecay.load(std::memory_order_relaxed);
         const float *ra = m_HybResA.data() + (size_t)ch * ROUTE_BANDS;
         float *rm = m_D4ResMax.data() + (size_t)ch * ROUTE_BANDS;
@@ -4788,15 +4853,15 @@ void Xorcist::ComputeChannelShadow(
       if (++m_StableCount[ch] >= STABLE_K) {
         const uint64_t onsetSamp = m_OnsetPeriod[ch] * m_SamplesPerBuffer;
 
-        // Blockt der Verdeckungs-Waechter, bleibt der Kandidat AM LEBEN
-        // und versucht es naechste Periode erneut (bis die TTL greift).
-        // Die erste Fassung verwarf ihn - bei 600 Luecken/min lag fast
-        // immer eine Luecke in den letzten 16 Perioden, und 4 von 6
-        // korrekt erkannten Einsaetzen verfielen ungenutzt.
-        // 8 statt 16 saubere Perioden: der Patch-Bau liest ohnehin ein
-        // 32-Perioden-Fenster - die 16 waren immer ein Kompromiss, und
-        // bei 600 Luecken/min blockten sie trotz Wiederholens die
-        // Haelfte der korrekt erkannten Einsaetze.
+        // If the concealment guard blocks here, the candidate stays
+        // ALIVE and retries next period (until the TTL expires).  An
+        // earlier version discarded it instead - at 600 gaps/min, a gap
+        // almost always fell within the last 16 periods, and 4 of 6
+        // correctly detected onsets expired unused.
+        // 8 rather than 16 clean periods: the patch construction itself
+        // reads a 32-period window anyway - the 16 was always a
+        // compromise, and at 600 gaps/min it blocked half the correctly
+        // detected onsets despite the retry.
         const bool retry = m_PatchMode.load(std::memory_order_relaxed)
           && (mask & 0xFFu) != 0;
 
@@ -4808,7 +4873,7 @@ void Xorcist::ComputeChannelShadow(
           m_LastPatchSample[ch] = onsetSamp;
 
           s_PatchCount.fetch_add(1, std::memory_order_relaxed);
-          if (ch == 0) { // sonst zaehlt die Anzeige jeden Einsatz doppelt
+          if (ch == 0) { // otherwise the display would double-count each onset
             const uint64_t n = s_PatchLogN.load(std::memory_order_relaxed);
             uint64_t *e = s_PatchLog[n % PATCH_LOG];
 
@@ -4819,13 +4884,13 @@ void Xorcist::ComputeChannelShadow(
           }
           if (getenv("XO_SIM_TRACE") && ch == 0)
             fprintf(
-              stderr, "PATCH %.3f s (Einsatz war %.3f s)\n",
+              stderr, "PATCH %.3f s (onset was %.3f s)\n",
               (double)nowP * m_SamplesPerBuffer / m_SampleRate,
               (double)onsetSamp / m_SampleRate);
         }
-        // Wiederholen heisst: Kandidat lebt weiter, eine Periode vor der
-        // Beruhigungsschwelle geparkt.  Die vorige Fassung setzte ihn
-        // hier bedingungslos zurueck und hob damit genau das auf.
+        // Retrying means: the candidate stays alive, parked one period
+        // short of the settle threshold.  An earlier version reset it
+        // unconditionally here, which undid exactly this.
         if (retry) {
           m_StableCount[ch] = STABLE_K - 1;
         } else {
@@ -4891,14 +4956,14 @@ void Xorcist::ComputeChannelShadow(
   // exponent fades to 0 there.  Measured effect of the gate: dense
   // orchestral material returns exactly to its trend-off numbers while
   // the swell (-1.0 -> -25.2 dB excess) and the held tone keep the gain.
-  // ---- Sollbruchstelle: Analyse | Synthese -----------------------------
-  // Alles OBERHALB fuettert Zustand (Spektrum-Cache, Rotator,
-  // Routing-Ring, AR-Ring, Normalgleichungen); alles UNTERHALB erzeugt
-  // nur den Schatten.  Wenn der Aufrufer weiss, dass keine Luecke nahe
-  // ist - das Offline-Lab kennt seine Positionen -, ist der Schatten
-  // weggeworfene Arbeit: bei 60 Luecken/min verfallen 6582 von 6634
-  // Schatten pro Datei ungehoert.  Absorb() setzt das Flag und spart
-  // die Synthese; der Analyse-Zustand bleibt EXAKT der der Engine.
+  // ---- designed fracture point: analysis | synthesis -------------------
+  // Everything ABOVE this feeds state (spectrum cache, rotator, routing
+  // ring, AR ring, normal equations); everything BELOW only produces the
+  // shadow.  When the caller knows no gap is coming - the offline lab
+  // tool knows its gap positions in advance - the shadow is wasted work:
+  // at 60 gaps/min, 6582 of 6634 shadows per file are built and never
+  // heard.  Absorb() sets a flag and skips the synthesis; the analysis
+  // state stays EXACTLY what the engine would produce.
   arClock.Stop(XO_ST_AR_AKKU);
   if (m_AnalyzeOnly)
     return;
@@ -4992,10 +5057,10 @@ void Xorcist::ComputeChannelShadow(
 
         return e ? (unsigned)atoi(e) : 0u;
       }();
-      // solveEvery: 1 = jeder Bin in jeder Periode neu aufgeloest, wie
-      // der Prototyp es bei jeder Luecke tut.  0 = der gestreifte
-      // Standard, jeder Bin alle AR_SOLVE_EVERY*arStride = 16 Perioden.
-      // Gemessen an den Toneinsaetzen des Nutzers: 1,22 dB von 1,52.
+      // solveEvery: 1 = every bin re-solved every period, as the offline
+      // prototype does for every gap.  0 = the striped default, every
+      // bin every AR_SOLVE_EVERY*arStride = 16 periods.  Measured on the
+      // onset calibration material: 1.22 dB out of 1.52.
       const int solveEv = m_Replica.load(std::memory_order_relaxed)
         ? 1 : m_SolveEvery.load(std::memory_order_relaxed);
       const unsigned cycle = solveEv > 0
@@ -5019,21 +5084,21 @@ void Xorcist::ComputeChannelShadow(
             rRe[(size_t)bin * AR_ORDER_MAX + k] = 0.0f;
             rIm[(size_t)bin * AR_ORDER_MAX + k] = 0.0f;
           }
-      // ---- RECHTECKFENSTER statt exponentiellem Vergessen -----------
-      // Der Offline-Prototyp fittet ueber J gleichgewichtete Rahmen und
-      // vergisst danach ABRUPT alles; die Akkumulatoren hier vergessen
-      // exponentiell und werden nichts je ganz los.  Nominell gleich
-      // lang (J=20 gegen 1/(1-lambda)=22), aber an einer Ansprache ist
-      // der Unterschied gross: der Prototyp ist den alten Ton nach 20
-      // Rahmen los, die Bibliothek schleppt ihn gedaempft weiter und
-      // verbraucht Freiheitsgrade darauf, ihn mitzumodellieren.  Das ist
-      // die verbliebene Erklaerung dafuer, dass der Prototyp mit
-      // nominell vier Freiheitsgraden leistet, wofuer diese Bibliothek
-      // acht bis zwoelf braucht.
+      // ---- RECTANGULAR window instead of exponential forgetting -----
+      // The offline prototype fits over J equally-weighted frames and
+      // then forgets everything ABRUPTLY; the accumulators here forget
+      // exponentially and never fully let go of anything.  Nominally the
+      // same length (J=20 vs. 1/(1-lambda)=22), but at an onset the
+      // difference is large: the prototype has shed the old tone after
+      // 20 frames, while this library keeps dragging a damped tail of
+      // it along and spends degrees of freedom modelling that tail too.
+      // This remains the best explanation for why the prototype matches
+      // this library's quality with a nominal order of four, where this
+      // library needs eight to twelve.
       //
-      // Neu aufgebaut wird aus dem Spektrenring, genau wie der Prototyp
-      // es aus seiner Historie tut.  Der Ring haelt AR_ORDER_MAX*stride+1
-      // Perioden, also J <= (ringLen-1)/stride - P + 1 Tupel.
+      // Rebuilt from the spectrum ring, exactly as the prototype rebuilds
+      // from its own history.  The ring holds AR_ORDER_MAX*stride+1
+      // periods, so J <= (ringLen-1)/stride - P + 1 tuples.
       const bool replica = m_Replica.load(std::memory_order_relaxed) != 0;
       const unsigned fitWin = replica
         ? 20u : (unsigned)m_FitWindow.load(std::memory_order_relaxed);
@@ -5041,11 +5106,12 @@ void Xorcist::ComputeChannelShadow(
       if (fitWin) {
         const unsigned jMax = (m_ArRingLen - 1) / arStride + 1 - P;
         const unsigned J = std::min(fitWin, jMax);
-        // Der Rebuild bleibt je Bin und rechnet in einen DICHTEN
-        // Zwischenspeicher - dieselbe Summationsreihenfolge wie vorher,
-        // also bitgleiche Werte.  Erst am Ende wird das obere Dreieck in
-        // die planare Ablage geschrieben.  Der Pfad ist in GO ohnehin aus
-        // (fitWindow 0) und nur im Replica-Modus scharf.
+        // The rebuild stays per-bin and accumulates into a DENSE scratch
+        // buffer - same summation order as before, so bit-identical
+        // values.  Only at the end is the upper triangle written out to
+        // the planar storage.  This path is disabled in the host
+        // application anyway (fitWindow 0) and only active in replica
+        // mode.
         double wPb[AR_ORDER_MAX * AR_ORDER_MAX * 2], wQb[AR_ORDER_MAX * 2];
         bool ok = J >= P + 2 && nowP >= (uint64_t)(J - 1 + P) * arStride;
 
@@ -5057,8 +5123,8 @@ void Xorcist::ComputeChannelShadow(
         }
         if (ok)
           for (unsigned bin = b0; bin < b1; bin++) {
-            // Der Rechteck-Rebuild wuerde den Hybrid-Reset rueckgaengig
-            // machen - junge Baender behalten ihren frischen Akkumulator.
+            // The rectangular rebuild would undo the hybrid reset -
+            // young bands keep their fresh accumulator instead.
             if (hybOn && m_HybReset.load(std::memory_order_relaxed)
                 && HybBandYoung(ch, bin >> bandShift))
               continue;
@@ -5100,7 +5166,7 @@ void Xorcist::ComputeChannelShadow(
                 }
               }
             }
-            // Dreieck zurueckschreiben; der Rest ist die Spiegelung.
+            // Write the triangle back out; the rest is the mirror.
             {
               const size_t pb
                 = (size_t)ch * AR_PAIRS * NBINS_MAX + bin;
@@ -5123,11 +5189,11 @@ void Xorcist::ComputeChannelShadow(
       bool gpuDone = false;
 
 #ifndef XO_NO_OPENCL
-      // v1: Geraet nur fuer den Standardpfad - Rechteckfenster (replica)
-      // und Schur bleiben CPU.  Scheitert das Geraet, uebernimmt die CPU
-      // nahtlos: ihre Akkumulatoren sind weitergelaufen.
-      // Detektor-Modus kann der Kernel seit dem 07.08. selbst; nur
-      // Rechteckfenster (replica) und Schur bleiben CPU.
+      // v1: the GPU device only handles the standard path - rectangular
+      // window (replica) and Schur stay on the CPU.  If the device
+      // fails, the CPU takes over seamlessly: its accumulators have been
+      // running all along.  The kernel can also handle detector mode by
+      // itself; only rectangular window (replica) and Schur stay CPU.
       if (
         m_Gpu.load(std::memory_order_relaxed) && !m_GpuBad && !fitWin
         && !s_UseSchur.load(std::memory_order_relaxed))
@@ -5137,9 +5203,9 @@ void Xorcist::ComputeChannelShadow(
         .fetch_add(1, std::memory_order_relaxed);
       if (!gpuDone)
       for (unsigned bin = b0; bin < b1; bin++) {
-        // Junge Hybrid-Baender loest gleich die Leiter bei ihrer
-        // Altersordnung - ein voller P-Solve auf dem frischen Akkumulator
-        // waere unterbestimmt.
+        // Young hybrid bands are instead solved by the ladder at their
+        // own age-order - a full order-P solve on a fresh accumulator
+        // would be underdetermined.
         if (hybOn && m_HybReset.load(std::memory_order_relaxed)
             && HybBandYoung(ch, bin >> bandShift))
           continue;
@@ -5149,9 +5215,9 @@ void Xorcist::ComputeChannelShadow(
           cRe + (size_t)bin * AR_ORDER_MAX, cIm + (size_t)bin * AR_ORDER_MAX,
           rRe + (size_t)bin * AR_ORDER_MAX, rIm + (size_t)bin * AR_ORDER_MAX);
       }
-      // Leiter-Solve der jungen Baender - JEDE Periode, auch wenn der
-      // Streifen sie nicht traf, und NACH der GPU (deren voller P-Solve
-      // fuer diese Bins wird hier ueberschrieben).
+      // Ladder solve of the young bands - EVERY period, even if the
+      // stripe did not touch them, and AFTER the GPU (whose full-order-P
+      // solve for these bins gets overwritten right here).
       if (hybOn && m_HybReset.load(std::memory_order_relaxed))
         HybridSolveLongYoung(ch, P, arStride, bandShift, nbins);
 
@@ -5225,8 +5291,9 @@ void Xorcist::ComputeChannelShadow(
   // this loop is squarely memory-bound (measured: with the arithmetic
   // removed it costs exactly as much as a plain copy).
   std::fill(ola, ola + m_ShadowLen, 0.0f);
-  // Hindcast des Samples VOR der Grenze (v0Hindcast), samt eigener
-  // Fenstergewichtssumme - t = -1 hat einen Frame weniger als t = 0.
+  // Hindcast of the sample BEFORE the boundary (v0Hindcast), with its own
+  // window-weight sum - t = -1 has one fewer contributing frame than
+  // t = 0.
   const bool v0Shadow = m_V0Hindcast.load(std::memory_order_relaxed) != 0;
   float shadowM1 = 0.0f, shadowM1W = 0.0f;
 
@@ -5234,10 +5301,10 @@ void Xorcist::ComputeChannelShadow(
   // "+2" synthesized one to two full (and unused) iFFT frames per call.
   const unsigned kEnd = (m_ShadowLen + nfft + synHop - 1) / synHop;
 
-  // Koeffizienten einmal je Runde nach [k][bin] umlegen.  Danach liest die
-  // Extrapolation nur noch zusammenhaengend.  nbins*P Werte gegen
-  // nbins*P*arSteps*(kEnd-1) Multiplikationen dahinter - der Umbau kostet
-  // ein Vielfaches weniger, als er einspart.
+  // Transpose the coefficients to [k][bin] once per round.  After that,
+  // the extrapolation only ever reads contiguously.  nbins*P values
+  // against nbins*P*arSteps*(kEnd-1) multiplications downstream - the
+  // transpose costs a fraction of what it saves.
   if (useAr) {
     const size_t cb = (size_t)ch * NBINS_MAX * AR_ORDER_MAX;
     const float *srcRe = m_ArCoefRe.data() + cb;
@@ -5324,9 +5391,9 @@ void Xorcist::ComputeChannelShadow(
         pFreq[bin][1] = im;
       }
     }
-    // HYBRID: junge Baender aus der langen Kette ausblenden (1 - w);
-    // die kurze Kette liefert denselben Anteil mit w, die Summe bleibt
-    // punktweise eins.
+    // HYBRID: fade young bands out of the long chain (1 - w); the short
+    // chain supplies that same share with w, so the sum stays one
+    // pointwise.
     static const bool hybNoB = getenv("XO_HYB_NO_B") != nullptr;
 
     if (hybOn && m_HybAny[ch] && !hybNoB) {
@@ -5335,14 +5402,15 @@ void Xorcist::ComputeChannelShadow(
       for (unsigned bin = 0; bin < nbins; bin++) {
         const unsigned b = bin >> bandShift;
 
-        // BINAER, nicht gemischt: bei 0 < w < 1 addierten sich ZWEI
-        // verschiedene Vorhersagen desselben Bandes, deren Phasen in der
-        // Luecke auseinanderlaufen - die Summe kaemmt (gemessen: Schaden
-        // waechst mit der Uebergabezeit, Rest-Luecken -2.55 -> +0.83).
-        // Zwischen zwei Luecken gibt es keine Stetigkeitspflicht: jede
-        // wird eigenstaendig verdeckt und an der Naht ans echte Signal
-        // gebunden.  Die Rampe von w bleibt als ENTPRELLUNG des
-        // Umschaltpunkts, gehoert wird nur ganz A oder ganz B.
+        // BINARY, never blended: with 0 < w < 1, TWO different
+        // predictions of the same band would add, and their phases drift
+        // apart across the gap - the sum combs (measured: the damage
+        // grows with the transition time, residual gaps -2.55 -> +0.83).
+        // There is no continuity obligation between two separate gaps:
+        // each is concealed independently and tied back to the real
+        // signal at its own seam.  The ramp on w remains only as a
+        // DEBOUNCE on the switch point; what is actually heard is always
+        // either all A or all B.
         if (hw[b < ROUTE_BANDS ? b : ROUTE_BANDS - 1] > 0.5f) {
           pFreq[bin][0] = 0.0f;
           pFreq[bin][1] = 0.0f;
@@ -5361,8 +5429,9 @@ void Xorcist::ComputeChannelShadow(
 
     const float scale = 1.0f / nfft;
 
-    // Hindcast-Anker (XO_V0_SHADOW): dieselben Frames decken das Sample
-    // VOR der Grenze mit ab - ein Sample einsammeln statt wegschneiden.
+    // Hindcast anchor (XO_V0_SHADOW): the same frames also cover the
+    // sample BEFORE the boundary - collect that one sample instead of
+    // discarding it.
     if (v0Shadow && start <= -1) {
       const unsigned j = (unsigned)(-1 - start);
 
@@ -5380,8 +5449,8 @@ void Xorcist::ComputeChannelShadow(
   if (v0Shadow && shadowM1W > 1e-9f)
     shadowM1 /= shadowM1W;
 
-  // HYBRID: die kurze Kette traegt ihre (mit w gewichteten) Baender bei.
-  // VOR Cap und Naht - beide arbeiten auf der fertigen Summe.
+  // HYBRID: the short chain contributes its bands, weighted by w. BEFORE
+  // the cap and the seam - both operate on the finished sum.
   static const bool hybNoB2 = getenv("XO_HYB_NO_B") != nullptr;
 
   if (hybOn && m_HybAny[ch] && !hybNoB2)
@@ -5410,24 +5479,25 @@ void Xorcist::ComputeChannelShadow(
   // smaller, the limit tightens.  s_CapHits/s_CapCalls measure how often
   // that actually happens, per order.
   //
-  // capSpan ist die ANTWORT auf genau diesen Verdacht und war bis
-  // 2026-08-09 eine Attrappe: m_CapSpan wurde in setTuning abgelegt, von
-  // getTuning zurueckgelesen - und nie benutzt.  Der Haken "Cap nur
-  // Gap+Fade" hat also in Lab UND GO nichts getan; alle Messreihen mit
-  // gesetztem Haken haben in Wahrheit den ganzen Schatten gemessen.
+  // capSpan is the ANSWER to exactly this suspicion, and for a while was
+  // a dummy: m_CapSpan was stored by setTuning and read back by
+  // getTuning - but never actually used anywhere.  So the "cap only over
+  // gap+fade" switch did nothing in either the lab tool or the host
+  // application; every measurement series run with that switch set had,
+  // in truth, measured the peak over the whole shadow regardless.
   //
-  // Gemessen wird jetzt nur ueber die Strecke, die als naechstes wirklich
-  // ausgegeben wird (Luecke + Wiedereinstiegsblende).  Divergenz JENSEITS
-  // davon ist das Problem des naechsten Puffers - falls es dann noch eine
-  // ist.  capSpan 0 heisst weiterhin: ganzer Schatten.
+  // It now measures only over the span that will actually be played next
+  // (the gap plus its re-entry fade).  Divergence BEYOND that span is the
+  // next buffer's problem - if it still is one by then.  capSpan 0 still
+  // means: the whole shadow.
   //
-  // Der ermittelte Faktor wirkt bewusst auf den GANZEN Schatten, nicht nur
-  // auf die gemessene Strecke: eine Kette aufeinanderfolgender Fehlschlaege
-  // laeuft ohne neue Analyse Scheibe fuer Scheibe durch denselben Schatten,
-  // und eine nur teilweise skalierte Kurve haette an der Spannengrenze eine
-  // Stufe - ein Knacks, den es vorher nicht gab.  Die Spanne steuert also
-  // WORAUF GESCHAUT wird, nicht worauf multipliziert wird; der Verdacht
-  // oben richtet sich ausschliesslich gegen das Hinschauen.
+  // The resulting factor is deliberately applied to the WHOLE shadow, not
+  // only to the measured span: a chain of consecutive deadline misses
+  // runs through the same shadow slice by slice without a new analysis,
+  // and a curve scaled only partially would have a step right at the span
+  // boundary - an audible click that was not there before.  So the span
+  // controls WHAT IS LOOKED AT, not what gets multiplied; the suspicion
+  // above is directed purely at the looking, not at the scaling.
   {
     const int span = m_CapSpan.load(std::memory_order_relaxed);
     const unsigned nLook = span > 0
@@ -5517,14 +5587,13 @@ void Xorcist::ComputeChannelShadow(
     double v0 = 0.0;
 
     if (v0Shadow)
-      // Hindcast-Anker: Versatz DIREKT am letzten echten Sample gemessen
-      // (Schatten[-1] gegen die Wahrheit), statt die Wahrheit an
-      // Schatten[0] vorherzusagen.  jump wird unten einmal zusaetzlich
-      // mit decay multipliziert - die Exponentiale sitzt ein Sample
-      // frueher.
+      // Hindcast anchor: the offset is measured DIRECTLY at the last real
+      // sample (shadow[-1] against ground truth), instead of predicting
+      // ground truth from shadow[0].  jump gets multiplied by one extra
+      // factor of decay below - the exponential sits one sample earlier.
       v0 = (double)pHist[len - 1] + ((double)pShadow[0] - (double)shadowM1);
     else if (s_V0Last)
-      v0 = (double)pHist[len - 1]; // Messknopf: letztes echtes Sample
+      v0 = (double)pHist[len - 1]; // measurement switch: last real sample
     else
       for (unsigned j = 0; j < BURG_ORDER; j++)
         v0 += a[j] * (double)pHist[len - 1 - j];
@@ -5566,11 +5635,11 @@ void Xorcist::ComputeChannelShadow(
     // Geometric decay: one multiply per sample, no transcendental in the
     // loop.  After m_AnchorLen (= 10 tau) the factor is < 5e-5.
     //
-    // tau ist seit 06.08.2026 einstellbar (anchorTau, in Samples): der
-    // Anker ist eine BREITBANDIGE Exponentiale - kuerzeres tau heisst
-    // mehr Hochtonenergie bei gleicher Sprunghoehe, laengeres verteilt
-    // denselben Betrag tiefer und leiser.  Der Nutzer will die Wirkung
-    // an Transienten hoeren.
+    // tau is configurable (anchorTau, in samples): the anchor is a
+    // BROADBAND exponential - a shorter tau means more high-frequency
+    // energy for the same jump height, a longer one spreads the same
+    // amount lower and quieter.  Useful for hearing the effect directly
+    // on transients.
     double k = jump * (1.0 - (double)wBridge);
     const unsigned m = m_Replica.load(std::memory_order_relaxed)
       ? m_ShadowLen : std::min(m_ShadowLen, m_AnchorLen);
@@ -5581,8 +5650,8 @@ void Xorcist::ComputeChannelShadow(
     const unsigned mm = tauCfg > 0
       ? std::min(m_ShadowLen, 10u * tau) : m;
 
-    // Hindcast-Anker: die Exponentiale ist am Sample VOR der Grenze
-    // verankert, an Schatten[0] ist sie schon einen Schritt abgeklungen.
+    // Hindcast anchor: the exponential is anchored at the sample BEFORE
+    // the boundary; at shadow[0] it has already decayed by one step.
     if (v0Shadow)
       k *= decay;
 
@@ -5592,11 +5661,11 @@ void Xorcist::ComputeChannelShadow(
     }
   }
 
-  // 1:1-Nachbau des Offline-Prototyps: dort laeuft _safety_cap NACH
-  // with_anchor_corrector, nicht davor.  Greift er, zieht er pShadow[0]
-  // wieder von v0 weg - genau den Sprung, den der Anker beseitigt hat.
-  // Die Bibliothek macht es normalerweise umgekehrt (und besser); hier
-  // geht es um Gleichheit, nicht um Qualitaet.
+  // Exact replica of the offline prototype: there, _safety_cap runs
+  // AFTER with_anchor_corrector, not before.  When it engages, it pulls
+  // pShadow[0] back away from v0 - exactly the jump the anchor just
+  // removed.  This library normally does it the other way round (and
+  // better); this branch exists for bit-for-bit parity, not quality.
   if (m_Replica.load(std::memory_order_relaxed)) {
     float histPeak = 0.0f, shadowPeak = 0.0f;
 
@@ -5617,12 +5686,12 @@ void Xorcist::ComputeChannelShadow(
   capClock.Stop(XO_ST_CAP_NAHT);
 }
 
-// Baut den Rueckwaerts-Patch fuer [zoneStart, zoneStart+len) aus dem
-// Zustand der LETZTEN Analyse dieses Kanals: Rahmen k entsteht durch
-// k-fache konjugierte Rotation des juengsten Spektrums (Schrittweite =
-// Synthese-Hop), synthetisiert per OLA mit denselben Fenstern wie die
-// Analyse - jede spaetere Fensterung ueber der Zone sieht damit per
-// COLA in sich konsistente, phasenkontinuierliche Rahmen.
+// Builds the backward patch for [zoneStart, zoneStart+len) from this
+// channel's LATEST analysis state: frame k is produced by rotating the
+// most recent spectrum k times by its conjugate (step size = synthesis
+// hop), then synthesised via OLA with the same windows the analysis
+// uses - so by COLA, any later windowing over the zone sees internally
+// consistent, phase-continuous frames.
 bool Xorcist::BuildBackPatch(unsigned ch, uint64_t zoneStart, unsigned len) {
   const int mode = m_Mode.load(std::memory_order_relaxed);
 
@@ -5637,7 +5706,7 @@ bool Xorcist::BuildBackPatch(unsigned ch, uint64_t zoneStart, unsigned len) {
   if (len == 0 || len > PATCH_MAX)
     return false;
   if (m_SpecCachePeriod[ch] == ~0ull || m_SpecCacheNfft[ch] != nfft)
-    return false; // noch keine gueltige Analyse
+    return false; // no valid analysis yet
 
   const uint64_t refEnd = m_SpecCachePeriod[ch] * m_SamplesPerBuffer;
   const uint64_t zoneEnd = zoneStart + len;
@@ -5652,7 +5721,7 @@ bool Xorcist::BuildBackPatch(unsigned ch, uint64_t zoneStart, unsigned len) {
   float *const pTime = m_TimeBuf + (size_t)ch * NFFT_MAX;
   fftwf_complex *const pFreq = m_FreqBuf + (size_t)ch * FREQ_STRIDE;
   const float *win = kit.win.data();
-  // Laufende Rueckwaerts-Rotation des Spektrums
+  // Running backward rotation of the spectrum
   std::vector<float> xr(nbins), xi(nbins);
 
   for (unsigned b = 0; b < nbins; b++) {
@@ -5663,18 +5732,19 @@ bool Xorcist::BuildBackPatch(unsigned ch, uint64_t zoneStart, unsigned len) {
   std::vector<double> acc(len, 0.0), wsum(len, 1e-12);
   const float scale = 1.0f / (float)nfft;
 
-  // k = 0 ist der ECHTE aktuelle Rahmen, unrotiert - er MUSS beitragen:
-  // ohne ihn deckt nur der Fensterauslaeufer von k = 1 die Zone, wsum
-  // faellt am rechten Rand gegen null, und die Division verstaerkt jede
-  // Rahmen-Unstimmigkeit tausendfach.  Der Sinus-Test konnte das nicht
-  // zeigen: fuer ihn ist jeder Rahmen allein exakt, (w^2 x)/(w^2) = x
-  // bei beliebig kleinem Gewicht.  Erst dichtes Material, dessen Rahmen
-  // sich leicht widersprechen, macht Deckungsluecken zu Spitzen.
+  // k = 0 is the REAL current frame, unrotated - it MUST contribute:
+  // without it, only frame k = 1's window tail covers the zone, wsum
+  // falls to near zero at the right edge, and the division then
+  // amplifies any frame disagreement a thousandfold.  A pure sine-wave
+  // test could not reveal this: for it every frame alone is exact,
+  // (w^2 x)/(w^2) = x at any weight, however small.  Only on dense
+  // material, whose frames disagree slightly with each other, do
+  // coverage gaps turn into spikes.
   for (unsigned k = 0; k <= 64; k++) {
     const uint64_t fEnd = refEnd - (uint64_t)k * synHop;
 
     if (fEnd <= zoneStart)
-      break; // dieser und alle aelteren Rahmen enden vor der Zone
+      break; // this and every older frame end before the zone
 
     const uint64_t fStart = fEnd - nfft;
 
@@ -5696,7 +5766,7 @@ bool Xorcist::BuildBackPatch(unsigned ch, uint64_t zoneStart, unsigned len) {
         wsum[a - zoneStart] += (double)w * w;
       }
     }
-    // erst NACH der Verwendung zuruedrehen: k=0 bleibt unrotiert
+    // only rotate back AFTER use: k=0 stays unrotated
     for (unsigned b = 0; b < nbins; b++) {
       const float re = xr[b] * rotRe[b] + xi[b] * rotIm[b];  // * conj(rot)
       const float im = xi[b] * rotRe[b] - xr[b] * rotIm[b];
@@ -5706,8 +5776,9 @@ bool Xorcist::BuildBackPatch(unsigned ch, uint64_t zoneStart, unsigned len) {
     }
   }
 
-  // Normieren und mit kurzen Rampen in die echte Historie einbetten:
-  // links (Alt-Ton) 128 Samples, rechts (phasenexakt) 64 als Sicherung.
+  // Normalise and embed into the real history with short ramps: 128
+  // samples on the left (old tone), 64 on the right (phase-exact) as a
+  // safety margin.
   const float *real = HistWindow(ch, (unsigned)(refEnd - zoneStart));
   float *pb = m_PatchBuf.data() + (size_t)ch * PATCH_MAX;
 
@@ -5743,9 +5814,9 @@ void Xorcist::Absorb() {
 
   if (m_HistFill.load(std::memory_order_relaxed) < kit.nfft + kit.nfft / 4)
     return;
-  // Kein Slot, keine Publikation, kein Busy-Protokoll: es entsteht kein
-  // Schatten.  pShadow zeigt auf Slot 0, wird aber im Analyse-Teil nie
-  // beschrieben.
+  // No slot, no publication, no busy flag: no shadow is actually
+  // produced.  pShadow points at slot 0 but the analysis-only path never
+  // writes to it.
   m_AnalyzeOnly = true;
   for (unsigned ch = 0; ch < m_NChannels; ch++)
     ComputeChannelShadow(
@@ -5809,12 +5880,13 @@ int Xorcist::Predict() {
     const uint64_t lastConc
       = m_LastConcealedPeriod.load(std::memory_order_acquire);
 
-    // replica: NIE behalten, immer neu rechnen - der Offline-Prototyp
-    // baut fuer JEDE Luecke eine frische Fortsetzung.  Verkettet las die
-    // Bibliothek dagegen ab der zweiten Luecke einer Kette nur eine
-    // spaetere SCHEIBE des alten Schattens, und die kennt das inzwischen
-    // gespielte Material nicht.  Bei 6000/min sind 1768 Luecken in 914
-    // Ketten, also wird etwa jede zweite Luecke so bedient.
+    // replica: NEVER keep the running extrapolation, always recompute -
+    // the offline prototype builds a fresh continuation for EVERY gap.
+    // Chained together, this library instead serves the second and later
+    // gap of a streak from a later SLICE of the old shadow, which knows
+    // nothing of the material played since.  At 6000 gaps/min, 1768 gaps
+    // fall into 914 streaks, so roughly every second gap is served this
+    // way.
     if (
       !m_Replica.load(std::memory_order_relaxed)
       && (m_ConcealedThrough.load(std::memory_order_acquire) == histNow
@@ -5826,17 +5898,18 @@ int Xorcist::Predict() {
 
   if (m_ComputeBusy.exchange(true, std::memory_order_acquire)) {
     m_SkipCount.fetch_add(1, std::memory_order_relaxed);
-    // Fuer die Ursachen-Zuordnung der spaeten Scheiben: WANN (in
-    // Periodenzeit) die letzte Oeffnung am Besetzt-Waechter scheiterte.
+    // For attributing late slices to a cause: WHEN (in period time) the
+    // last attempt failed on the busy guard.
     m_LastSkipPeriod.store(histNow, std::memory_order_relaxed);
-    return 3; // besetzt - fuer den Wirt unterscheidbar von "nichts zu tun"
+    return 3; // busy - distinguishable by the host from "nothing to do"
   }
 
   m_PendingSlot = pub == SHADOW_INVALID ? 0u : (unsigned)(~pub & 1ull);
   m_PendingPeriod = histNow;
-  // Ab hier liest die Runde aus IHREM Kopf, nicht aus dem laufenden.  Das
-  // Etikett m_PendingPeriod und die Daten, die die Kanaele sehen, gehoeren
-  // damit garantiert zusammen - egal wer waehrenddessen pusht.
+  // From here on, this round reads from ITS OWN frozen head, not the live
+  // one.  That guarantees the m_PendingPeriod tag and the data the
+  // channels actually see belong together, no matter what pushes happen
+  // concurrently.
   m_RoundHead = m_HistWrite.load(std::memory_order_acquire);
   m_RoundMask = m_RecentPredMask.load(std::memory_order_relaxed);
   m_RoundFrozen.store(!s_NoFreeze, std::memory_order_release);
@@ -5870,29 +5943,30 @@ void Xorcist::PredictAbort() {
 }
 
 void Xorcist::PredictEnd() {
-  // Hier stand bis 10.08.2026 eine Verwerfung: liefen waehrend der Runde
-  // Pushes durch, war die Analyse verdorben (die Kanaele lasen relativ zum
-  // LAUFENDEN Schreibkopf, das Fenster rutschte den spaeteren unter den
-  // Fuessen weg), und die einzige Rettung war, die ganze Runde
-  // wegzuwerfen.  Der Preis dafuer war hoch: der Anker blieb stehen, und
-  // die naechste Verdeckung spielte eine Scheibe > 0 - ausgerechnet dort,
-  // wo die Nahtreparatur nicht sitzt, denn die sitzt nur auf Scheibe 0.
-  // Im laufenden GO liess sich beides zaehlen, und beide Zaehler liefen.
+  // This used to discard the round outright: if pushes happened while a
+  // round was running, the analysis was corrupted (the channels read
+  // relative to the LIVE write head, so the window slid out from under
+  // the later ones), and the only remedy was throwing away the whole
+  // round.  That was expensive: the anchor stayed put, and the next
+  // concealment then played a slice > 0 - precisely where the seam
+  // repair does not apply, since that only ever runs on slice 0.  Both
+  // costs were measurable in the running host application, and both
+  // counters were non-zero.
   //
-  // Die Ursache ist jetzt weg statt behandelt: die Runde friert ihren
-  // Schreibkopf in PredictBegin ein (siehe m_RoundHead), ein
-  // gleichzeitiger Push kann das Fenster also gar nicht mehr verschieben.
-  // Was die Kanaele gelesen haben, gehoert zum Etikett m_PendingPeriod -
-  // die Runde ist gueltig und wird veroeffentlicht, auch wenn der Ring
-  // inzwischen weitergelaufen ist.  Conceal rechnet die zwischenzeitlichen
-  // Perioden ohnehin sauber heraus (slice = histNow - anchor).
+  // The cause is now removed rather than merely handled: a round freezes
+  // its own write head in PredictBegin (see m_RoundHead), so a concurrent
+  // push can no longer shift the window at all.  What the channels read
+  // belongs to the m_PendingPeriod tag by construction - the round is
+  // valid and gets published even if the ring has advanced further in
+  // the meantime.  Conceal() already accounts cleanly for any periods in
+  // between (slice = histNow - anchor).
   //
-  // Gezaehlt wird der Vorfall weiter: er misst, wie oft der Rueckruf in
-  // eine laufende Runde hineinschreibt, und bleibt damit das Mass fuer die
-  // Nebenlaeufigkeit - nur kostet er jetzt keinen Schatten mehr.
+  // The event is still counted: it measures how often a callback writes
+  // into a round while it is still running, and so remains the metric
+  // for this concurrency - it simply no longer costs a shadow.
   if (m_HistPeriod.load(std::memory_order_acquire) != m_PendingPeriod) {
     s_StaleDiscards.fetch_add(1, std::memory_order_relaxed);
-    if (s_NoFreeze) { // alter Zustand: Runde wegwerfen
+    if (s_NoFreeze) { // legacy behaviour: discard the round
       m_RoundFrozen.store(false, std::memory_order_release);
       m_ComputeBusy.store(false, std::memory_order_release);
       return;
@@ -5947,10 +6021,10 @@ int Xorcist::Conceal(float *pOutBuf) {
     if (slice < m_HorizonPeriods) {
       shadowIdx = (int)(pub & 1ull);
       sliceOffset = (unsigned)slice * m_SamplesPerBuffer;
-      // Scheibe > 0 ist LEGITIM in einer Fehlschlagkette (die
-      // selbstgefuetterte Reihe ist EINE zusammenhaengende Fortschreibung).
-      // Zaehlenswert ist nur der andere Fall: echtes Audio lief
-      // dazwischen, der Anker ist trotzdem zurueckgeblieben.
+      // Slice > 0 is LEGITIMATE within a streak of consecutive misses
+      // (the self-fed series is ONE continuous extrapolation).  Only the
+      // other case is worth counting: real audio played in between, yet
+      // the anchor was left behind anyway.
       if (
         slice > 0
         && m_LastConcealedPeriod.load(std::memory_order_acquire) != histNow) {
@@ -6022,11 +6096,11 @@ int Xorcist::Conceal(float *pOutBuf) {
   // time-aligned history.  Marking the position lets Predict() recognise
   // the streak and KEEP its running extrapolation rather than re-analyse
   // its own output.
-  // Die SELBSTFUETTERUNG darf nie geblendet werden: sie schreibt die
-  // gerade gespielte Vorhersage, keinen Wiedereinstieg.  Ohne dieses
-  // Zuruecksetzen mischte die zweite Luecke einer Kette ihre eigene
-  // Ausgabe mit dem Schattenschwanz der ersten - bei 914 Ketten die
-  // Haelfte aller Verdeckungen.
+  // The SELF-FEED push must never be cross-faded: it is writing the
+  // prediction that was just played, not a re-entry.  Without this
+  // reset, the second gap of a streak would blend its own output with
+  // the first gap's shadow tail - at 914 streaks, half of all
+  // concealments.
   m_RingBlendPending = false;
   Push(pOutBuf);
   m_RecentPredMask.store(
@@ -6036,7 +6110,7 @@ int Xorcist::Conceal(float *pOutBuf) {
     m_HistPeriod.load(std::memory_order_acquire), std::memory_order_release);
   m_LastConcealedPeriod.store(m_HistPeriod.load(std::memory_order_acquire),
                               std::memory_order_release);
-  m_RingBlendPending = true;   // erst der NAECHSTE echte Push blendet
+  m_RingBlendPending = true;   // only the NEXT real push blends
   return played;
 }
 
@@ -6116,9 +6190,9 @@ void Xorcist_solveTapInfo(
     *pNbins = Xorcist::s_TapNbins;
   if (pOrder)
     *pOrder = Xorcist::s_TapOrder;
-  // Insgesamt geschrieben, nicht nur noch abrufbar - nur damit laesst
-  // sich waehrend eines Laufs sagen, WIE VIELE Bilder seit dem letzten
-  // Blick dazugekommen sind.
+  // Total ever written, not just what's still available - only this
+  // lets a caller tell, during a run, HOW MANY frames have arrived
+  // since the last read.
   if (pTotal)
     *pTotal = n;
 }
@@ -6137,8 +6211,8 @@ unsigned Xorcist_solveTapRead(
   if (!take || !nb)
     return 0;
 
-  // Die JUENGSTEN take Bilder, aelteste zuerst: Startschlitz ist der
-  // Schreibzeiger minus take.
+  // The take MOST RECENT frames, oldest first: the starting slot is
+  // the write cursor minus take.
   const uint64_t first = n - take;
 
   for (unsigned i = 0; i < take; i++) {
@@ -6182,9 +6256,9 @@ void Xorcist_analysisGeometry(
     return;
   }
 
-  // Dieselben Ausdruecke wie im Rechenpfad - bewusst hier wiederholt und
-  // nicht in Python nachgebaut, wo sie beim naechsten Umbau veralten
-  // wuerden.
+  // Same expressions as in the compute path - deliberately duplicated
+  // here rather than reimplemented in Python, where they would go
+  // stale the next time the compute path is refactored.
   const Xorcist::PvKit &kit = x->m_Pv[Xorcist::KitIndex(mode)];
   const unsigned nfft = kit.nfft;
   const unsigned synHop = nfft / 4;
@@ -6238,11 +6312,11 @@ void Xorcist_setTuning(Xorcist *x, const XorcistTuning *t) {
     x->m_D4ResDecay.store(t->detResDecay, std::memory_order_relaxed);
   x->m_V0Hindcast.store(t->v0Hindcast ? 1 : 0, std::memory_order_relaxed);
   x->m_SolveTap.store(t->solveTap ? 1 : 0, std::memory_order_relaxed);
-  // 0 = aus; JEDES rho > 0 scharf.  Die erste Fassung verwarf rho <= 1
-  // stillschweigend als "sinnloses Budget" - der Nutzer hat die
-  // Attrappe sofort gefunden: rho = 0.5 MUSS die Luecke hoerbar
-  // ausbluten lassen (jede Mode halbiert sich pro Hop), sonst beisst
-  // der Knopf nicht.  Extremwerte sind Beisstests, keine Fehler.
+  // 0 = off; ANY rho > 0 is enforced as given, with no lower clamp.
+  // An earlier version silently discarded rho <= 1 as a "meaningless
+  // budget" - but rho = 0.5 MUST make the gap audibly decay (every
+  // mode halves per hop), or the control has no effect. Extreme
+  // values are meant as stress tests, not treated as errors.
   Xorcist::s_DetectRho.store(
     t->detectRho > 0.0f ? t->detectRho : 0.0f, std::memory_order_relaxed);
   Xorcist::s_RootClamp.store(
@@ -6514,11 +6588,12 @@ void Xorcist_hybStats(
       = Xorcist::s_HybBandPeriods.exchange(0, std::memory_order_relaxed);
 }
 
-// Welche Diagnoseschalter der Umgebung greifen GERADE?  Ein Wirt soll das
-// ANZEIGEN koennen, statt dass jemand nach einem A/B raten muss, ob seine
-// Variable ueberhaupt angekommen ist - in diesem Projekt war stille
-// Wirkungslosigkeit mehrfach die Fehlerursache.  Gemeldet wird nur, was
-// vom Standard abweicht; leerer String heisst "alles auf Vorgabe".
+// Which of the environment's diagnostic switches are active RIGHT NOW?
+// A host should be able to DISPLAY this instead of making someone guess
+// by A/B testing whether their env var even took effect - silent
+// no-ops have repeatedly been the root cause of bugs in this project.
+// Only reports what differs from the default; an empty string means
+// "everything at default".
 const char *Xorcist_diagOverrides(void) {
   static const std::string s = [] {
     static const char *const names[] = {
@@ -6600,7 +6675,7 @@ unsigned Xorcist_onsetLog(uint64_t *pOut, unsigned maxEvents) {
     = seq < Xorcist::ONSET_LOG ? (unsigned)seq : Xorcist::ONSET_LOG;
   const unsigned n = maxEvents < have ? maxEvents : have;
 
-  // Neueste zuletzt - ein Zeichner laeuft die Liste vorwaerts durch.
+  // Newest last - a renderer walks the list forward.
   for (unsigned i = 0; i < n; i++) {
     const uint32_t slot = (seq - n + i) % Xorcist::ONSET_LOG;
 
