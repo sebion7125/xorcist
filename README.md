@@ -7,12 +7,13 @@ not finished in time, Xorcist synthesizes a spectral continuation of
 the signal and plays that instead of a dropout, rather than falling
 back to silence. See the header-level design comment in `xorcist.h`
 for the DSP approach, and
-[`docs/disclosures/xorcist-concealment-technical-disclosure.md`](../../docs/disclosures/xorcist-concealment-technical-disclosure.md)
-(in the host repository this library was extracted from) for a full,
-host-independent technical disclosure of the technique, including its
-measured results and limitations. For every public function and
-`XorcistTuning` field, in man-page style, see
-[`docs/API.md`](docs/API.md).
+[`docs/disclosures/xorcist-concealment-technical-disclosure.md`](docs/disclosures/xorcist-concealment-technical-disclosure.md)
+for a full, host-independent technical disclosure of the technique,
+including its measured results and limitations. (Also submitted to
+Technical Disclosure Commons; mirrored here so it ships with the code
+it describes rather than only with the host application it was
+extracted from.) For every public function and `XorcistTuning` field,
+in man-page style, see [`docs/API.md`](docs/API.md).
 
 ![Spectrogram of a concealed dropout](docs/media/spectogram_xorcist.gif)
 
