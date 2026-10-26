@@ -38,29 +38,19 @@ GO-1knob strategy.)
 
 ## Listen
 
-Same comparison, as audio (re-muxed into a video container with a
-blank placeholder frame — GitHub only renders an inline player for
-files uploaded through its attachment pipeline, not for files
-committed in the repo itself, and rejects an audio-only container
-outright). If the player below doesn't show for you, the linked raw
-file is the fallback — plays in the browser's own native player
-instead.
+Same comparison, as audio. GitHub's Markdown renderer strips `<audio>`
+and only plays `<video>` for files uploaded through its attachment
+pipeline — and even then only for a signed-in viewer, so it's not an
+option for a public README's actual readers. The links below point at
+the raw file (`?raw=true`); the browser opens its own native player
+for it directly, without GitHub in the way:
 
-**Unconcealed (hard xrun)** — the dropout itself, matching the "off"
-column above. ([raw file](docs/media/audio/demo-unconcealed.mp3?raw=true))
-
-<video controls src="https://github.com/user-attachments/assets/a19f083a-9794-41a2-88de-62ad95ac2949"></video>
-
-**Concealed (Xorcist, order 5)** — same xrun, concealed.
-([raw file](docs/media/audio/demo-concealed-order5.mp3?raw=true))
-
-<video controls src="https://github.com/user-attachments/assets/735a9c51-8852-451c-99a2-d0fc6a48a5a3"></video>
-
-**Original, no forced gaps** — the undamaged reference material both
-takes above are cut from.
-([raw file](docs/media/audio/demo-original.wav?raw=true))
-
-<video controls src="https://github.com/user-attachments/assets/e87475df-ec34-496e-bfd8-e01815e0e57a"></video>
+- [🔊 Unconcealed (hard xrun)](docs/media/audio/demo-unconcealed.mp3?raw=true) —
+  the dropout itself, matching the "off" column above.
+- [🔊 Concealed (Xorcist, order 5)](docs/media/audio/demo-concealed-order5.mp3?raw=true) —
+  same xrun, concealed.
+- [🔊 Original, no forced gaps](docs/media/audio/demo-original.wav?raw=true) —
+  the undamaged reference material both takes above are cut from.
 
 **Status:** extracted from, and still developed alongside, its host
 application ([GrandOrgue](https://github.com/GrandOrgue/grandorgue)'s
