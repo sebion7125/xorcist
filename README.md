@@ -38,19 +38,12 @@ GO-1knob strategy.)
 
 ## Listen
 
-Same comparison, as audio. GitHub's Markdown renderer strips `<audio>`
-and only plays `<video>` for files uploaded through its attachment
-pipeline — and even then only for a signed-in viewer, so it's not an
-option for a public README's actual readers. The links below point at
-the raw file (`?raw=true`); the browser opens its own native player
-for it directly, without GitHub in the way:
-
-- [🔊 Unconcealed (hard xrun)](docs/media/audio/demo-unconcealed.mp3?raw=true) —
-  the dropout itself, matching the "off" column above.
-- [🔊 Concealed (Xorcist, order 5)](docs/media/audio/demo-concealed-order5.mp3?raw=true) —
-  same xrun, concealed.
-- [🔊 Original, no forced gaps](docs/media/audio/demo-original.wav?raw=true) —
-  the undamaged reference material both takes above are cut from.
+Same comparison, as audio: **[listen on GitHub Pages](https://sebion7125.github.io/xorcist/listen.html)**.
+(GitHub's README renderer strips `<audio>` outright, only plays
+`<video>` for files uploaded through its attachment pipeline and even
+then only for a signed-in viewer, and forces a download instead of
+inline playback on every plain raw-file link — none of which give an
+actual visitor a player, so this lives on Pages instead.)
 
 **Status:** extracted from, and still developed alongside, its host
 application ([GrandOrgue](https://github.com/GrandOrgue/grandorgue)'s
