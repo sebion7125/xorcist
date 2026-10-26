@@ -38,28 +38,29 @@ GO-1knob strategy.)
 
 ## Listen
 
-Same comparison, as audio (audio-only, re-muxed into a silent video
-container — GitHub only renders an inline player for files uploaded
-through its attachment pipeline, not for files committed in the repo
-itself). If the player below doesn't show for you, the linked raw
+Same comparison, as audio (re-muxed into a video container with a
+blank placeholder frame — GitHub only renders an inline player for
+files uploaded through its attachment pipeline, not for files
+committed in the repo itself, and rejects an audio-only container
+outright). If the player below doesn't show for you, the linked raw
 file is the fallback — plays in the browser's own native player
 instead.
 
 **Unconcealed (hard xrun)** — the dropout itself, matching the "off"
 column above. ([raw file](docs/media/audio/demo-unconcealed.mp3?raw=true))
 
-<video controls src="https://github.com/user-attachments/assets/c1f87ded-19bc-4ca3-92dd-50951b0530c2"></video>
+<video controls src="https://github.com/user-attachments/assets/4522876f-c635-4af3-a0f4-d2579c6fa363"></video>
 
 **Concealed (Xorcist, order 5)** — same xrun, concealed.
 ([raw file](docs/media/audio/demo-concealed-order5.mp3?raw=true))
 
-<video controls src="https://github.com/user-attachments/assets/8e6b2144-4672-4c97-9881-be8d4b5ec87a"></video>
+<video controls src="https://github.com/user-attachments/assets/ec0cc95a-d6c6-46be-b2f4-6b7f8c906b3c"></video>
 
 **Original, no forced gaps** — the undamaged reference material both
 takes above are cut from.
 ([raw file](docs/media/audio/demo-original.wav?raw=true))
 
-<video controls src="https://github.com/user-attachments/assets/55b01fca-fadd-4301-98d7-bf962c0017c6"></video>
+<video controls src="https://github.com/user-attachments/assets/0f5f0cea-11bb-434d-8e03-e3903e7062a5"></video>
 
 **Status:** extracted from, and still developed alongside, its host
 application ([GrandOrgue](https://github.com/GrandOrgue/grandorgue)'s
