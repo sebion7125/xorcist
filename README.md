@@ -38,17 +38,28 @@ GO-1knob strategy.)
 
 ## Listen
 
-Same comparison, as audio. GitHub's Markdown renderer doesn't give
-these an inline player, and its blob page doesn't either; the links
-below point at the raw file (`?raw=true`) so the browser opens its own
-native player directly, instead of GitHub's blob view:
+Same comparison, as audio (audio-only, re-muxed into a silent video
+container — GitHub only renders an inline player for files uploaded
+through its attachment pipeline, not for files committed in the repo
+itself). If the player below doesn't show for you, the linked raw
+file is the fallback — plays in the browser's own native player
+instead.
 
-- [🔊 Unconcealed (hard xrun)](docs/media/audio/demo-unconcealed.mp3?raw=true) —
-  the dropout itself, matching the "off" column above.
-- [🔊 Concealed (Xorcist, order 5)](docs/media/audio/demo-concealed-order5.mp3?raw=true) —
-  same xrun, concealed.
-- [🔊 Original, no forced gaps](docs/media/audio/demo-original.wav?raw=true) —
-  the undamaged reference material both takes above are cut from.
+**Unconcealed (hard xrun)** — the dropout itself, matching the "off"
+column above. ([raw file](docs/media/audio/demo-unconcealed.mp3?raw=true))
+
+<video controls src="https://github.com/user-attachments/assets/c1f87ded-19bc-4ca3-92dd-50951b0530c2"></video>
+
+**Concealed (Xorcist, order 5)** — same xrun, concealed.
+([raw file](docs/media/audio/demo-concealed-order5.mp3?raw=true))
+
+<video controls src="https://github.com/user-attachments/assets/8e6b2144-4672-4c97-9881-be8d4b5ec87a"></video>
+
+**Original, no forced gaps** — the undamaged reference material both
+takes above are cut from.
+([raw file](docs/media/audio/demo-original.wav?raw=true))
+
+<video controls src="https://github.com/user-attachments/assets/55b01fca-fadd-4301-98d7-bf962c0017c6"></video>
 
 **Status:** extracted from, and still developed alongside, its host
 application ([GrandOrgue](https://github.com/GrandOrgue/grandorgue)'s
