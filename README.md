@@ -36,6 +36,19 @@ same forced-gap pattern, only the concealment strategy differs —
 "off" plays the raw dropout, the other column runs Xorcist's PRONY/
 GO-1knob strategy.)
 
+## Listen
+
+Same comparison, as audio. GitHub doesn't render an inline player in
+this file, but clicking a link opens the file's blob page, which does
+have one:
+
+- [🔊 Unconcealed (hard xrun)](docs/media/audio/demo-unconcealed.mp3) —
+  the dropout itself, matching the "off" column above.
+- [🔊 Concealed (Xorcist, order 5)](docs/media/audio/demo-concealed-order5.mp3) —
+  same xrun, concealed.
+- [🔊 Original, no forced gaps](docs/media/audio/demo-original.wav) —
+  the undamaged reference material both takes above are cut from.
+
 **Status:** extracted from, and still developed alongside, its host
 application ([GrandOrgue](https://github.com/GrandOrgue/grandorgue)'s
 `GOSoundConcealment`); this is the same implementation that runs there,
