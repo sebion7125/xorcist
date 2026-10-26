@@ -49,18 +49,18 @@ instead.
 **Unconcealed (hard xrun)** — the dropout itself, matching the "off"
 column above. ([raw file](docs/media/audio/demo-unconcealed.mp3?raw=true))
 
-<video controls src="https://github.com/user-attachments/assets/4522876f-c635-4af3-a0f4-d2579c6fa363"></video>
+<video controls src="https://github.com/user-attachments/assets/a19f083a-9794-41a2-88de-62ad95ac2949"></video>
 
 **Concealed (Xorcist, order 5)** — same xrun, concealed.
 ([raw file](docs/media/audio/demo-concealed-order5.mp3?raw=true))
 
-<video controls src="https://github.com/user-attachments/assets/ec0cc95a-d6c6-46be-b2f4-6b7f8c906b3c"></video>
+<video controls src="https://github.com/user-attachments/assets/735a9c51-8852-451c-99a2-d0fc6a48a5a3"></video>
 
 **Original, no forced gaps** — the undamaged reference material both
 takes above are cut from.
 ([raw file](docs/media/audio/demo-original.wav?raw=true))
 
-<video controls src="https://github.com/user-attachments/assets/0f5f0cea-11bb-434d-8e03-e3903e7062a5"></video>
+<video controls src="https://github.com/user-attachments/assets/e87475df-ec34-496e-bfd8-e01815e0e57a"></video>
 
 **Status:** extracted from, and still developed alongside, its host
 application ([GrandOrgue](https://github.com/GrandOrgue/grandorgue)'s
