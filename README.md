@@ -38,15 +38,16 @@ GO-1knob strategy.)
 
 ## Listen
 
-Same comparison, as audio. GitHub doesn't render an inline player in
-this file, but clicking a link opens the file's blob page, which does
-have one:
+Same comparison, as audio. GitHub's Markdown renderer doesn't give
+these an inline player, and its blob page doesn't either; the links
+below point at the raw file (`?raw=true`) so the browser opens its own
+native player directly, instead of GitHub's blob view:
 
-- [🔊 Unconcealed (hard xrun)](docs/media/audio/demo-unconcealed.mp3) —
+- [🔊 Unconcealed (hard xrun)](docs/media/audio/demo-unconcealed.mp3?raw=true) —
   the dropout itself, matching the "off" column above.
-- [🔊 Concealed (Xorcist, order 5)](docs/media/audio/demo-concealed-order5.mp3) —
+- [🔊 Concealed (Xorcist, order 5)](docs/media/audio/demo-concealed-order5.mp3?raw=true) —
   same xrun, concealed.
-- [🔊 Original, no forced gaps](docs/media/audio/demo-original.wav) —
+- [🔊 Original, no forced gaps](docs/media/audio/demo-original.wav?raw=true) —
   the undamaged reference material both takes above are cut from.
 
 **Status:** extracted from, and still developed alongside, its host
